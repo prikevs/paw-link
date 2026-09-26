@@ -1,0 +1,18 @@
+{
+  "checked_on": "2026-09-26",
+  "publisher": "TensorFlow / Google",
+  "model": "EfficientDet-Lite2 detection metadata",
+  "version": 1,
+  "format": "TensorFlow Lite",
+  "license": "Apache-2.0",
+  "license_evidence": "https://www.kaggle.com/models/tensorflow/efficientdet/tfLite/lite2-detection-metadata/1?tfhub-redirect=true",
+  "download_url": "https://www.kaggle.com/api/v1/models/tensorflow/efficientdet/tfLite/lite2-detection-metadata/1/download",
+  "archive_member": "1.tflite",
+  "bundled_file": "android/app/src/main/assets/efficientdet_lite2.tflite",
+  "bytes": 7557887,
+  "sha256": "6fd32c84ab1eb0f7e7f3a7a20a20d7df1530daa8378728f7c79571096286bd52",
+  "modifications": "Filename only; model bytes unchanged",
+  "source_verified": true,
+  "license_review": "Resolved for the currently bundled artifact",
+  "device_validation": "Pixel 9 Pro: model smoke test PASS; see VALIDATION.md"
+}

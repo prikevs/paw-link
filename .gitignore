@@ -1,0 +1,46 @@
+.arduino/
+.tools/
+.venv/
+__pycache__/
+*.pyc
+build/
+data/
+.gradle/
+local.properties
+.DS_Store
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+key.properties
+
+# Generated tools and app output
+.build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+**/Flutter/ephemeral/
+*.apk
+*.aab
+*.app/
+
+# Private recordings, session exports, and backups
+sessions/
+exports/
+backup/
+backups/
+*.mp4
+*.mov
+*.zip
+*.tar.gz
+
+# Downloaded model-test fixtures (not part of releases)
+/android/app/src/androidTest/assets/model-test/

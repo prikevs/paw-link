@@ -1,0 +1,10 @@
+[project]
+name = "paw-link-collector"
+version = "0.1.0"
+description = "BLE IMU data collector for Paw Link"
+requires-python = ">=3.11"
+dependencies = [
+  "bleak==3.0.2",
+  "numpy>=2.2,<3",
+  "scikit-learn==1.9.1",
+]

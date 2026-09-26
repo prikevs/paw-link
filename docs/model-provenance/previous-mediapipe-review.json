@@ -1,0 +1,18 @@
+{
+  "checked_on": "2026-09-26",
+  "bundled_file": "android/app/src/main/assets/efficientdet_lite2.tflite",
+  "bundled_bytes": 7515971,
+  "bundled_sha256": "b3f50554cb0ea559e90328845f7d9ba4d13c8bff372914d24e06bc8bb72fa896",
+  "official_url": "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/int8/1/efficientdet_lite2.tflite",
+  "google_storage_generation": "1682636018933532",
+  "official_bytes_match": true,
+  "licensed_comparison_page": "https://www.kaggle.com/models/tensorflow/efficientdet/tfLite/lite2-detection-metadata/1",
+  "comparison_download": "https://www.kaggle.com/api/v1/models/tensorflow/efficientdet/tfLite/lite2-detection-metadata/1/download",
+  "comparison_member": "1.tflite",
+  "comparison_bytes": 7557887,
+  "comparison_sha256": "6fd32c84ab1eb0f7e7f3a7a20a20d7df1530daa8378728f7c79571096286bd52",
+  "comparison_license_on_model_page": "Apache 2.0",
+  "comparison_matches_bundled": false,
+  "conclusion": "Source verified. Exact-artifact redistribution license remains unresolved. No model replaced.",
+  "status": "superseded: replaced with explicitly licensed Kaggle artifact after user approval"
+}

@@ -1,0 +1,86 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CLI_VERSION=1.5.1
+CLI="$ROOT/.tools/arduino-cli"
+FQBN=Seeeduino:mbed:xiaonRF52840Sense
+SKETCH="$ROOT/firmware/self_test"
+BUILD_DIR="$ROOT/build/self_test"
+SEEED_INDEX=https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+
+export ARDUINO_DIRECTORIES_DATA="$ROOT/.arduino/data"
+export ARDUINO_DIRECTORIES_DOWNLOADS="$ROOT/.arduino/downloads"
+export ARDUINO_DIRECTORIES_USER="$ROOT/.arduino/user"
+
+find_port() {
+  if [ -n "${PORT:-}" ]; then
+    printf '%s\n' "$PORT"
+    return
+  fi
+  for candidate in /dev/cu.usbmodem*; do
+    if [ -e "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  printf '%s\n' "No XIAO USB serial port found. Set PORT=/dev/cu.usbmodem..." >&2
+  exit 1
+}
+
+install_cli() {
+  if [ -x "$CLI" ]; then
+    return
+  fi
+  mkdir -p "$ROOT/.tools"
+  archive="$ROOT/.tools/arduino-cli.tar.gz"
+  curl -fsSL "https://github.com/arduino/arduino-cli/releases/download/v${CLI_VERSION}/arduino-cli_${CLI_VERSION}_macOS_ARM64.tar.gz" -o "$archive"
+  tar -xzf "$archive" -C "$ROOT/.tools" arduino-cli
+  rm -f "$archive"
+}
+
+require_cli() {
+  if [ ! -x "$CLI" ]; then
+    printf '%s\n' "Development tools are missing. Run: make setup" >&2
+    exit 1
+  fi
+}
+
+case "${1:-help}" in
+  setup)
+    install_cli
+    "$CLI" core update-index --config-file "$ROOT/arduino-cli.yaml"
+    "$CLI" core install Seeeduino:mbed@2.9.3 --additional-urls "$SEEED_INDEX"
+    "$CLI" lib install "Seeed Arduino LSM6DS3@2.0.7"
+    "$CLI" lib install "ArduinoBLE@2.1.0"
+    "$CLI" version
+    "$CLI" core list
+    "$CLI" lib list
+    ;;
+  compile)
+    require_cli
+    mkdir -p "$BUILD_DIR"
+    "$CLI" compile --fqbn "$FQBN" --output-dir "$BUILD_DIR" "$SKETCH"
+    ;;
+  upload)
+    require_cli
+    port=$(find_port)
+    "$CLI" upload --fqbn "$FQBN" --port "$port" --input-dir "$BUILD_DIR" "$SKETCH"
+    ;;
+  monitor)
+    require_cli
+    port=$(find_port)
+    "$CLI" monitor --port "$port" --config baudrate=115200
+    ;;
+  check)
+    port=$(find_port)
+    python3 "$ROOT/scripts/serial_check.py" "$port"
+    ;;
+  clean)
+    rm -rf "$ROOT/build"
+    ;;
+  *)
+    printf '%s\n' "Usage: scripts/paw {setup|compile|upload|monitor|check|clean}"
+    exit 2
+    ;;
+esac

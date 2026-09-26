@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="paw_background">#F5F5EF</color>
+    <color name="paw_surface">#1B2229</color>
+    <color name="paw_accent">#60D394</color>
+    <color name="paw_text">#F2F5F7</color>
+    <color name="paw_muted">#AAB5BE</color>
+</resources>

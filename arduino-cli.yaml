@@ -1,0 +1,5 @@
+board_manager:
+  additional_urls:
+    - https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+updater:
+  enable_notification: false

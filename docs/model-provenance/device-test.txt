@@ -1,0 +1,16 @@
+
+PASS
+Image 1200x600
+cat 0.7421875 RectF(877.0, 406.0, 1085.0, 596.0)
+cat 0.65625 RectF(69.0, 394.0, 484.0, 598.0)
+dog 0.34375 RectF(606.0, 155.0, 907.0, 601.0)
+bird 0.2578125 RectF(385.0, 216.0, 652.0, 597.0)
+cat 0.7421875 RectF(877.0, 406.0, 1085.0, 596.0)
+cat 0.65625 RectF(69.0, 394.0, 484.0, 598.0)
+cat 0.62109375 RectF(30.0, 198.0, 237.0, 298.0)
+cat 0.62109375 RectF(437.0, 203.0, 543.0, 298.0)
+Scaled-box IoU=0.9811321
+Scaled-box IoU=0.9368494
+App result conversion and stable-frame rest suggestion: PASS
+Previous MediaPipe ms: median=411.574667 p95=423.293335 max=425.737671
+New Kaggle ms: median=235.1874395 p95=258.67216 max=290.782878

@@ -1,0 +1,11 @@
+EfficientDet-Lite2 detection metadata, TensorFlow Lite, version 1
+Publisher: TensorFlow / Google
+License: Apache License, Version 2.0 (see efficientdet-lite2-APACHE-2.0.txt)
+Model page: https://www.kaggle.com/models/tensorflow/efficientdet/tfLite/lite2-detection-metadata/1
+Download: https://www.kaggle.com/api/v1/models/tensorflow/efficientdet/tfLite/lite2-detection-metadata/1/download
+Archive member: 1.tflite
+Packaged name: efficientdet_lite2.tflite
+SHA-256: 6fd32c84ab1eb0f7e7f3a7a20a20d7df1530daa8378728f7c79571096286bd52
+The model bytes are unmodified; only the filename has changed.
+Source and license checked on 2026-09-26.
+This attribution file was prepared by PawLink; it is not an upstream NOTICE.
