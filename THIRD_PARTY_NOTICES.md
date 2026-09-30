@@ -38,9 +38,11 @@ The dependency manifests and lockfiles are the version records:
 
 This file is an inventory, not a complete binary dependency notice bundle. Before distributing compiled apps or firmware, collect the license and notice files for the exact linked dependencies, including the Arduino libraries and board core. The project license does not remove any of their redistribution requirements.
 
-## Separate local components
+## Native macOS app and animation resources
 
-The native macOS app, photo-derived animation assets, original reference photos, and enclosure designs are not in this repository at the time of this review. Do not infer permission to redistribute those files from this license. Import them with their source and license notices when they become part of a release.
+The native macOS software is included under `apps/pawlink_macos/` and follows the root software license. Its seven runtime animation PNG files are existing project ImageGen outputs; their source and license scope are recorded in [ASSETS.md](apps/pawlink_macos/ASSETS.md), with SHA-256 values in the asset manifest. They do not automatically inherit the software license.
+
+Original reference photographs and enclosure designs remain outside this repository. This import does not include compiled macOS application bundles or grant rights to those excluded components.
 
 ## Flutter templates and default icons
 

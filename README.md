@@ -11,6 +11,7 @@ PawLink is an experimental pet collar project that connects motion sensing, on-c
 | Collar firmware | `firmware/self_test/` | XIAO nRF52840 Sense firmware; 50 Hz six-axis IMU, predictions, battery readings, and clock synchronization over BLE. |
 | Android Capture | `android/` | Video and IMU recording, activity candidates, manual interval annotation, and versioned exports. Current version: **0.7.3**. |
 | Data and models | `collector/`, `models/` | Python collection, feature extraction, training, classification, and model artifacts. |
+| Native macOS pet | `apps/pawlink_macos/` | AppKit desktop pet with seven animations and a local HTTP action API. |
 | Flutter pet | `apps/pawlink_pet/` | Pet animation prototype targeting Android, macOS, Windows, and Linux. |
 | Tools and documentation | `scripts/`, `docs/` | Setup, firmware upload, model export, BLE bridge, hardware and protocol references. |
 
@@ -98,7 +99,15 @@ Use `flutter devices` to select another target. See the [Flutter app guide](apps
 
 ### Native macOS pet bridge
 
-The native pet and its image assets are separate local components, outside this repository. With its HTTP service running at `http://127.0.0.1:8766`:
+Build and start the native app from the repository:
+
+```sh
+cd apps/pawlink_macos
+./build.sh
+open "PawLink Pet.app"
+```
+
+Requires macOS 13 or later and Apple Swift tools. See the [native app guide](apps/pawlink_macos/README.md) and [HTTP API](apps/pawlink_macos/API.md). With its service running at `http://127.0.0.1:8766`, run this from the repository root:
 
 ```sh
 make pet-bridge
@@ -137,4 +146,4 @@ Android checks are documented in its [guide](android/README.md).
 
 Keep recordings, session exports, private photos, signing keys, and local configuration out of Git. The annotation test video is a generated color-pattern fixture, not a recording.
 
-Original PawLink software and documentation use [Apache-2.0](LICENSE), which permits commercial use and includes a contributor patent license under its terms. Third-party code, models, and data retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md). Separate photo-derived assets and enclosure designs are outside this repository's license scope until imported with explicit notices.
+Original PawLink software and documentation use [Apache-2.0](LICENSE), which permits commercial use and includes a contributor patent license under its terms. Third-party code, models, and data retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md). The native app's generated animation resources have a separate [asset scope notice](apps/pawlink_macos/ASSETS.md). Original reference photographs and enclosure designs remain outside this repository.

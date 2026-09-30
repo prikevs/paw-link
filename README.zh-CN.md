@@ -11,6 +11,7 @@ PawLink 是一个实验性宠物项圈项目，连接运动数据采集、项圈
 | 项圈固件 | `firmware/self_test/` | XIAO nRF52840 Sense 固件，通过 BLE 输出 50 Hz 六轴 IMU、预测、电池读数和时钟同步信息。 |
 | Android Capture | `android/` | 视频与 IMU 录制、活动候选、人工区间标注和版本化导出。当前版本：**0.7.3**。 |
 | 数据与模型 | `collector/`、`models/` | Python 采集、特征提取、训练、分类和模型文件。 |
+| macOS 原生桌宠 | `apps/pawlink_macos/` | AppKit 桌面宠物，提供七种动画和本机 HTTP 动作接口。 |
 | Flutter 宠物 | `apps/pawlink_pet/` | 面向 Android、macOS、Windows 和 Linux 的宠物动画原型。 |
 | 工具与文档 | `scripts/`、`docs/` | 环境安装、固件烧录、模型导出、BLE 桥接、硬件和协议说明。 |
 
@@ -98,7 +99,15 @@ flutter run -d macos
 
 ### macOS 原生桌宠桥接
 
-原生桌宠及图片素材是仓库外的独立本地组件。启动桌宠，使其在 `http://127.0.0.1:8766` 提供 HTTP 服务后执行：
+从仓库构建并启动原生桌宠：
+
+```sh
+cd apps/pawlink_macos
+./build.sh
+open "PawLink Pet.app"
+```
+
+需要 macOS 13 或更高版本与 Apple Swift 工具。详见[原生桌宠说明](apps/pawlink_macos/README.md)和 [HTTP API](apps/pawlink_macos/API.md)。服务启动在 `http://127.0.0.1:8766` 后，从仓库根目录执行：
 
 ```sh
 make pet-bridge
@@ -137,4 +146,4 @@ Android 检查方法见其[使用说明](android/README.md)。
 
 采集录像、会话导出、私人照片、签名密钥和本机配置不提交 Git。标注测试视频是生成的彩色图案，不是实际录像。
 
-PawLink 原创软件和文档采用 [Apache-2.0](LICENSE)，依条款允许商业使用并提供贡献者专利许可。第三方代码、模型和数据保留各自许可证，见[第三方说明](THIRD_PARTY_NOTICES.md)。仓库外的照片衍生素材和外壳设计需在导入时明确授权，不自动适用本仓库许可证。
+PawLink 原创软件和文档采用 [Apache-2.0](LICENSE)，依条款允许商业使用并提供贡献者专利许可。第三方代码、模型和数据保留各自许可证，见[第三方说明](THIRD_PARTY_NOTICES.md)。原生桌宠的生成动画资源有单独的[素材范围说明](apps/pawlink_macos/ASSETS.md)。原始参考照片和外壳设计仍在仓库外。
