@@ -10,8 +10,8 @@ android {
         applicationId = "com.pawlink.capture"
         minSdk = 31
         targetSdk = 36
-        versionCode = 13
-        versionName = "0.6.1"
+        versionCode = 17
+        versionName = "0.7.3"
         testInstrumentationRunner = "com.pawlink.capture.ModelSmokeInstrumentation"
     }
 

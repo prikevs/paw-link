@@ -44,3 +44,6 @@ backups/
 
 # Downloaded model-test fixtures (not part of releases)
 /android/app/src/androidTest/assets/model-test/
+
+# Generated color-pattern video for annotation instrumentation (no private footage)
+!/android/app/src/androidTest/assets/review-test/timeline.mp4

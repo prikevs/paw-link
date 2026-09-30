@@ -20,8 +20,9 @@ import java.lang.reflect.Method;
 
 /** On-device check. External fixtures are downloaded separately and never shipped. */
 public final class ModelSmokeInstrumentation extends Instrumentation {
+    private Bundle arguments;
     private final StringBuilder report = new StringBuilder();
-    @Override public void onCreate(Bundle args) { super.onCreate(args); start(); }
+    @Override public void onCreate(Bundle args) { arguments=args; super.onCreate(args); start(); }
     private void require(boolean ok, String message) {
         if (!ok) throw new AssertionError(message);
     }
@@ -87,6 +88,7 @@ public final class ModelSmokeInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle output = new Bundle();
         try {
+            if(arguments!=null&&"review".equals(arguments.getString("mode"))){ReviewFlowCheck.run(this);output.putString("stream","\nPASS review flow: automatic selection, context, save/next, skip/undo, reopen and grouped menus\n");finish(-1,output);return;}
             Bitmap image;
             try (java.io.InputStream stream = getContext().getAssets().open("model-test/cats_and_dogs.jpg")) {
                 image=BitmapFactory.decodeStream(stream);

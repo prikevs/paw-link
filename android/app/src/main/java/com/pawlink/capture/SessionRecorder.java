@@ -24,6 +24,9 @@ final class SessionRecorder {
     private BufferedWriter labelWriter;
     private BufferedWriter visionWriter;
     private BufferedWriter evidenceWriter;
+    private BufferedWriter syncWriter;
+    private final boolean handTest;
+    private final String catId, mounting;
     private boolean closed;
     private String writeError;
     private int epoch;
@@ -33,7 +36,8 @@ final class SessionRecorder {
     private long dropped;
     private Long lastSequence;
 
-    SessionRecorder(Context context) throws IOException {
+    SessionRecorder(Context context, boolean handTest, String catId, String mounting, int epoch) throws IOException {
+        this.handTest=handTest;this.catId=catId;this.mounting=mounting;this.epoch=epoch;
         String name = "session-" + ZonedDateTime.now()
                 .format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS"));
         File sessions = new File(context.getExternalFilesDir(null), "sessions");
@@ -45,12 +49,14 @@ final class SessionRecorder {
         frameWriter = new BufferedWriter(new FileWriter(new File(directory, "frames.csv")));
         labelWriter = new BufferedWriter(new FileWriter(new File(directory, "labels.csv")));
         visionWriter = new BufferedWriter(new FileWriter(new File(directory, "vision.csv")));
-        imuWriter.write("host_time_ns,elapsed_time_ns,device_time_ms,sequence,label,label_source,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps\n");
+        imuWriter.write("host_time_ns,elapsed_time_ns,device_time_ms,sequence,label,label_source,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,epoch\n");
         frameWriter.write("camera_time_ns,elapsed_time_ns\n");
         labelWriter.write("elapsed_time_ns,wall_time_ms,label,source\n");
         visionWriter.write("elapsed_time_ns,cat_visible,cat_score,motion_score,suggestion,suggestion_confidence,top_category,top_score\n");
         evidenceWriter = new BufferedWriter(new FileWriter(new File(directory, "evidence.csv")));
         evidenceWriter.write("elapsed_time_ns,epoch,kind,payload\n");
+        syncWriter=new BufferedWriter(new FileWriter(new File(directory,"sync.csv")));
+        syncWriter.write("epoch,t1_host_ns,t2_device_ms,t3_device_ms,t4_host_ns\n");
         setLabel("unknown", "system");
         writeManifest("recording");
     }
@@ -115,10 +121,10 @@ final class SessionRecorder {
             lastSequence = frame.sequence;
             samples++;
             imuWriter.write(String.format(Locale.US,
-                    "%d,%d,%d,%d,%s,%s,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f\n",
+                    "%d,%d,%d,%d,%s,%s,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f,%d\n",
                     System.currentTimeMillis() * 1_000_000L,
                     elapsedTimeNs, frame.deviceTimeMs, frame.sequence, label, labelSource,
-                    frame.ax, frame.ay, frame.az, frame.gx, frame.gy, frame.gz));
+                    frame.ax, frame.ay, frame.az, frame.gx, frame.gy, frame.gz, epoch));
             if (samples % 50 == 0) imuWriter.flush();
         } catch (IOException error) {
             writeError = error.getMessage();
@@ -128,7 +134,8 @@ final class SessionRecorder {
     synchronized String error() { return writeError; }
     synchronized long samples() { return samples; }
     synchronized long dropped() { return dropped; }
-    synchronized void newEpoch(String reason) { epoch++; lastSequence=null; recordEvidence("connection",reason,SystemClock.elapsedRealtimeNanos()); }
+    synchronized void setEpoch(int value,String reason) {epoch=value;lastSequence=null;recordEvidence("connection",reason,SystemClock.elapsedRealtimeNanos());}
+    synchronized void recordSync(int e,long t1,long t2,long t3,long t4){if(closed)return;try{syncWriter.write(e+","+t1+","+t2+","+t3+","+t4+"\n");syncWriter.flush();}catch(IOException ex){writeError=ex.getMessage();}}
     synchronized void recordEvidence(String kind,String value,long ns) {
         if(closed)return;
         try { evidenceWriter.write(ns+","+epoch+","+kind+",\""+value.replace("\"","\"\"").replace("\n"," ").replace("\r"," ")+"\"\n"); evidenceWriter.flush(); }
@@ -138,7 +145,7 @@ final class SessionRecorder {
         if(closed)return;
         closed=true;
         IOException failure=null;
-        for(BufferedWriter w:new BufferedWriter[]{imuWriter,frameWriter,labelWriter,visionWriter,evidenceWriter}) {
+        for(BufferedWriter w:new BufferedWriter[]{imuWriter,frameWriter,labelWriter,visionWriter,evidenceWriter,syncWriter}) {
             try { if(w!=null)w.close(); } catch(IOException e){failure=e;}
         }
         writeManifest(failure!=null||writeError!=null?"write_error":stopReason);
@@ -148,11 +155,13 @@ final class SessionRecorder {
     private void writeManifest(String stopReason) throws IOException {
         try {
             JSONObject manifest = new JSONObject();
-            manifest.put("schema_version", 2);
+            manifest.put("schema_version", 3);
+            manifest.put("capture_mode",handTest?"hand_test":"cat");
+            manifest.put("cat_id",catId);
             manifest.put("taxonomy_version", "pawlink-actions-v1");
-            manifest.put("sync_status", "uncalibrated_receive_time");
+            manifest.put("sync_status", "device_sync_requires_video_calibration");
             manifest.put("state", stopReason.equals("recording") ? "recording" : stopReason.equals("user_stop") ? "complete" : "interrupted");
-            manifest.put("mounting", "usb_left_components_out_long_axis_along_collar");
+            manifest.put("mounting", mounting);
             manifest.put("started_wall_ms", startedWallMs);
             manifest.put("started_elapsed_ns", startedElapsedNs);
             manifest.put("video_started_elapsed_ns",
@@ -166,7 +175,7 @@ final class SessionRecorder {
             manifest.put("ble_protocol", "pawlink-v1-20byte");
             manifest.put("vision_model", "efficientdet_lite2_int8_coco_cat_person");
             manifest.put("vision_policy", "auto_provisional_with_human_review");
-            manifest.put("app_version", "0.6.1");
+            manifest.put("app_version", "0.7.3");
             try (BufferedWriter writer = new BufferedWriter(
                     new FileWriter(new File(directory, "manifest.json")))) {
                 writer.write(manifest.toString(2));

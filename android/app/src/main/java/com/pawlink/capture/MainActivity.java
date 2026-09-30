@@ -65,16 +65,24 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
     private BleClient bleClient;
     private VisionAnalyzer visionAnalyzer;
     private ExecutorService cameraExecutor;
+    private final ExecutorService fileExecutor=Executors.newSingleThreadExecutor();
     private Recorder cameraRecorder;
     private Recording recording;
     private volatile SessionRecorder session;
+    private volatile File savingDirectory;
+    private File exportingDirectory;
     private LinearLayout capturePage, recordsPage, devicePage;
     private TextView deviceText, predictionText, timerText;
     private android.os.Handler uiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-    private long lastFrameNs, recordingStartNs, batteryNs;
+    private volatile long lastFrameNs;
+    private long recordingStartNs, batteryNs;
     private long lastDeviceMs=-1;
     private boolean multipleCats;
     private boolean cameraReady, finalizing;
+    private volatile boolean handTest;
+    private android.widget.CheckBox testMode;
+    private android.widget.EditText catInput,mountInput;
+    private final ClockSync clock=new ClockSync();
     private String battery="未知", voltage="未知", power="未知", prediction="尚未收到预测";
     private int selectedPage;
     private final java.util.Set<String> deletingSessions = new java.util.HashSet<>();
@@ -104,6 +112,10 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
         FrameLayout pages=new FrameLayout(this);root.addView(pages,new LinearLayout.LayoutParams(-1,0,1));
         capturePage=CaptureUi.column(this);pages.addView(capturePage,new FrameLayout.LayoutParams(-1,-1));
         capturePage.addView(text("同步采集 · 结束后人工确认",16,CaptureUi.INK));
+        testMode=new android.widget.CheckBox(this);testMode.setText("手持测试（关闭猫检测，不进入猫训练集）");capturePage.addView(testMode);
+        testMode.setOnCheckedChangeListener((b,c)->{handTest=c;detectionOverlay.clear();activeLabelText.setText(c?"手持测试 · IMU 候选在复核时生成":"视觉候选：待复核");});
+        catInput=new android.widget.EditText(this);catInput.setSingleLine();catInput.setHint("猫 ID（测试可留空）");capturePage.addView(catInput);
+        mountInput=new android.widget.EditText(this);mountInput.setSingleLine();mountInput.setHint("佩戴方向与松紧 / 手持方式");capturePage.addView(mountInput);
         timerText=text("00:00 · 720p 视频 + 六轴 IMU",14,CaptureUi.MUTED);capturePage.addView(timerText);
         FrameLayout cameraFrame=new FrameLayout(this);capturePage.addView(cameraFrame,new LinearLayout.LayoutParams(-1,0,1));
         previewView=new PreviewView(this);previewView.setImplementationMode(PreviewView.ImplementationMode.COMPATIBLE);
@@ -116,15 +128,15 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
         metricsText=text("IMU：尚未连接",16,CaptureUi.INK);info.addView(metricsText);
         visionText=text("视觉：正在初始化…",13,CaptureUi.MUTED);info.addView(visionText);
         predictionText=text("设备：尚未收到预测",13,CaptureUi.MUTED);info.addView(predictionText);
-        Button bookmark=button("＋ 标记此刻");bookmark.setOnClickListener(v->{if(session==null){Toast.makeText(this,"请先开始采集",0).show();return;}session.recordEvidence("bookmark","manual",SystemClock.elapsedRealtimeNanos());Toast.makeText(this,"已保存书签，自动候选继续记录",0).show();});capturePage.addView(bookmark);
+        Button bookmark=button("＋ 标记此刻");bookmark.setOnClickListener(v->{if(session==null){Toast.makeText(this,"请先开始采集",Toast.LENGTH_SHORT).show();return;}session.recordEvidence("bookmark","manual",SystemClock.elapsedRealtimeNanos());Toast.makeText(this,"已保存书签，自动候选继续记录",Toast.LENGTH_SHORT).show();});capturePage.addView(bookmark);
         recordButton=CaptureUi.button(this,"开始采集",true);recordButton.setEnabled(false);recordButton.setOnClickListener(v->toggleRecording());capturePage.addView(recordButton);
         android.widget.ScrollView recordsScroll=new android.widget.ScrollView(this);recordsPage=CaptureUi.column(this);recordsScroll.addView(recordsPage);pages.addView(recordsScroll,new FrameLayout.LayoutParams(-1,-1));recordsScroll.setTag("records");
         android.widget.ScrollView deviceScroll=new android.widget.ScrollView(this);devicePage=CaptureUi.column(this);deviceScroll.addView(devicePage);pages.addView(deviceScroll,new FrameLayout.LayoutParams(-1,-1));deviceScroll.setTag("device");
         devicePage.addView(CaptureUi.title(this,"当前项圈"));deviceText=text("未连接",16,CaptureUi.INK);devicePage.addView(deviceText);
-        connectButton=CaptureUi.button(this,"连接项圈",true);connectButton.setOnClickListener(v->{if(recording!=null){Toast.makeText(this,"采集中断线会自动重连",0).show();return;}if(!bleClient.hasPermission())requestRequiredPermissions();else bleClient.scanAndConnect();});devicePage.addView(connectButton);
+        connectButton=CaptureUi.button(this,"连接项圈",true);connectButton.setOnClickListener(v->{if(!bleClient.hasPermission())requestRequiredPermissions();else bleClient.scanAndConnect();});devicePage.addView(connectButton);Button resync=button("重新测量时钟同步");resync.setOnClickListener(v->bleClient.synchronizeNow());devicePage.addView(resync);
         LinearLayout mount=CaptureUi.card(this);mount.addView(text("佩戴方向",18,CaptureUi.INK));mount.addView(text("USB-C 朝左 · 元件面朝外\n板子长轴沿项圈方向",15,CaptureUi.MUTED));devicePage.addView(mount);
         LinearLayout abilities=CaptureUi.card(this);abilities.addView(text("模型能力与标注",18,CaptureUi.INK));abilities.addView(text("设备提供休息、移动、进食与舔毛预测。\n跳跃、洗脸、打滚通过视频人工标注。\n静止不等于睡眠；预测不是训练真值。",14,CaptureUi.MUTED));devicePage.addView(abilities);
-        Button off=button("设备关机");off.setOnClickListener(v->{if(recording!=null||finalizing){Toast.makeText(this,"请先结束采集并保存",0).show();return;}new AlertDialog.Builder(this).setTitle("关闭项圈？").setMessage("下次使用需要按 Reset 重新启动。").setNegativeButton("取消",null).setPositiveButton("确认关机",(d,w)->bleClient.shutdown()).show();});devicePage.addView(off);
+        Button off=button("设备关机");off.setOnClickListener(v->{if(recording!=null||finalizing){Toast.makeText(this,"请先结束采集并保存",Toast.LENGTH_SHORT).show();return;}new AlertDialog.Builder(this).setTitle("关闭项圈？").setMessage("下次使用需要按 Reset 重新启动。").setNegativeButton("取消",null).setPositiveButton("确认关机",(d,w)->bleClient.shutdown()).show();});devicePage.addView(off);
         LinearLayout nav=new LinearLayout(this);String[] names={"采集","记录","设备"};
         for(int i=0;i<3;i++){final int n=i;Button tab=button(names[i]);tab.setAlpha(i==0?1f:.65f);nav.addView(tab,new LinearLayout.LayoutParams(0,-2,1));tab.setOnClickListener(v->{selectedPage=n;for(int k=0;k<nav.getChildCount();k++)nav.getChildAt(k).setAlpha(k==n?1f:.65f);capturePage.setVisibility(n==0?View.VISIBLE:View.GONE);recordsScroll.setVisibility(n==1?View.VISIBLE:View.GONE);deviceScroll.setVisibility(n==2?View.VISIBLE:View.GONE);if(n==1)refreshRecords();});}
         root.addView(nav);recordsScroll.setVisibility(View.GONE);deviceScroll.setVisibility(View.GONE);setContentView(root);uiHandler.post(tick);
@@ -142,14 +154,24 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
         recordsPage.removeAllViews();recordsPage.addView(CaptureUi.title(this,"采集记录"));recordsPage.addView(text("原始资料保留，复核结果单独存储",14,CaptureUi.MUTED));
         File dir=new File(getExternalFilesDir(null),"sessions");File[] all=dir.listFiles(File::isDirectory);if(all==null||all.length==0){recordsPage.addView(text("还没有记录。连接项圈后开始采集。",16,CaptureUi.INK));return;}
         Arrays.sort(all,Comparator.comparing(File::getName).reversed());for(File f:all){LinearLayout card=CaptureUi.card(this);card.addView(text(f.getName(),16,CaptureUi.INK));
-            boolean active=session!=null&&f.equals(session.directory());boolean deleting=deletingSessions.contains(f.getName());boolean reviewed=new File(f,"review-v2.json").exists();card.addView(text(deleting?"正在删除…":active?"正在采集":reviewed?"已有复核结果，可继续编辑":"待复核",13,CaptureUi.MUTED));
+            boolean active=session!=null&&f.equals(session.directory())||f.equals(savingDirectory);boolean deleting=deletingSessions.contains(f.getName());
+            TextView summary=text(deleting?"正在删除…":active?"正在采集":"正在读取记录…",13,CaptureUi.MUTED);card.addView(summary);
+            if(!deleting&&!active)fileExecutor.execute(()->{String value=recordSummary(f);runOnUiThread(()->{if(!isDestroyed())summary.setText(value);});});
             Button open=button("打开视频复核");open.setEnabled(!active&&!deleting&&recording==null&&new File(f,"manifest.json").exists());open.setOnClickListener(v->{Intent intent=new Intent(this,ReviewActivity.class);intent.putExtra(ReviewActivity.EXTRA_SESSION_NAME,f.getName());startActivity(intent);});LinearLayout actions=new LinearLayout(this);actions.addView(open,new LinearLayout.LayoutParams(0,-2,2));
-            Button delete=button("删除");delete.setTextColor(Color.rgb(160,50,43));delete.setEnabled(!active&&!deleting);delete.setOnClickListener(v->confirmDeleteSession(f));actions.addView(delete,new LinearLayout.LayoutParams(0,-2,1));card.addView(actions);recordsPage.addView(card);}
+            Button delete=button("删除");delete.setTextColor(Color.rgb(160,50,43));delete.setEnabled(!active&&!deleting&&!f.equals(exportingDirectory));delete.setOnClickListener(v->confirmDeleteSession(f));actions.addView(delete,new LinearLayout.LayoutParams(0,-2,1));card.addView(actions);Button archive=button("导出全部原始与复核资料");archive.setEnabled(!active&&!deleting&&exportingDirectory==null);archive.setOnClickListener(v->exportRecord(f));card.addView(archive);recordsPage.addView(card);}
     }
+
+    private String recordSummary(File dir){
+        try{org.json.JSONObject m=new org.json.JSONObject(new String(java.nio.file.Files.readAllBytes(new File(dir,"manifest.json").toPath()),java.nio.charset.StandardCharsets.UTF_8));String kind=m.optString("capture_mode").equals("hand_test")?"手持测试":"猫："+m.optString("cat_id","未知");String state=m.optString("state");String status=state.equals("complete")?"待复核":state.equals("recording")?"异常中断 / 未完成落盘":"异常结束";File draft=new File(dir,"review-v3.json");if(draft.isFile()){org.json.JSONObject j=new org.json.JSONObject(new String(java.nio.file.Files.readAllBytes(draft.toPath()),java.nio.charset.StandardCharsets.UTF_8));org.json.JSONArray a=j.optJSONArray("segments");int confirmed=0;long usableMs=0;if(a!=null)for(int i=0;i<a.length();i++){org.json.JSONObject x=a.getJSONObject(i);if(x.optBoolean("confirmed")){confirmed++;if(!x.optBoolean("excluded")&&CaptureUi.trainable(x.optString("label")))usableMs+=x.optLong("end_video_ms")-x.optLong("start_video_ms");}}status+=" · 已确认 "+confirmed+"/"+(a==null?0:a.length())+" 个标注区间 · 可用行为 "+String.format(Locale.US,"%.1f",usableMs/1000.0)+" 秒（不代表全视频已复核）";}return kind+" · "+status;}catch(Exception e){return "资料不完整，可尝试打开或导出";}
+    }
+
+    private void exportRecord(File directory){if(exportingDirectory!=null)return;exportingDirectory=directory;refreshRecords();Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT);i.setType("application/zip");i.addCategory(Intent.CATEGORY_OPENABLE);i.putExtra(Intent.EXTRA_TITLE,directory.getName()+"-raw.zip");startActivityForResult(i,42);}
+    @Override protected void onActivityResult(int request,int result,Intent intent){super.onActivityResult(request,result,intent);if(request!=42)return;File directory=exportingDirectory;if(result!=RESULT_OK||intent==null||intent.getData()==null){exportingDirectory=null;refreshRecords();return;}android.net.Uri uri=intent.getData();fileExecutor.execute(()->{String message;try(java.util.zip.ZipOutputStream zip=new java.util.zip.ZipOutputStream(getContentResolver().openOutputStream(uri))){archiveTree(zip,directory,"");message="资料已导出";}catch(Exception e){message="导出失败："+e.getMessage();}String m=message;runOnUiThread(()->{exportingDirectory=null;if(!isDestroyed()){refreshRecords();Toast.makeText(this,m,Toast.LENGTH_LONG).show();}});});}
+    private void archiveTree(java.util.zip.ZipOutputStream zip,File directory,String prefix)throws IOException{File[] files=directory.listFiles();if(files==null)throw new IOException("目录无法读取");for(File f:files){if(java.nio.file.Files.isSymbolicLink(f.toPath())||f.getName().endsWith(".tmp"))continue;if(f.isDirectory())archiveTree(zip,f,prefix+f.getName()+"/");else{zip.putNextEntry(new java.util.zip.ZipEntry(prefix+f.getName()));try(java.io.InputStream in=new java.io.FileInputStream(f)){byte[] b=new byte[32768];int n;while((n=in.read(b))!=-1)zip.write(b,0,n);}zip.closeEntry();}}}
 
     private void confirmDeleteSession(File directory) {
         SessionRecorder current=session;
-        if (deletingSessions.contains(directory.getName()) || current!=null&&directory.equals(current.directory())) {
+        if (deletingSessions.contains(directory.getName()) || current!=null&&directory.equals(current.directory())||directory.equals(savingDirectory)) {
             Toast.makeText(this,"正在采集或删除中的记录不能删除",Toast.LENGTH_SHORT).show();
             return;
         }
@@ -163,8 +185,8 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
 
     private void deleteSession(File directory) {
         SessionRecorder current=session;
-        File active=current==null?null:current.directory();
-        if (directory.equals(active) || !deletingSessions.add(directory.getName())) return;
+        File active=current==null?savingDirectory:current.directory();
+        if (directory.equals(active) || directory.equals(exportingDirectory) || !deletingSessions.add(directory.getName())) return;
         refreshRecords();
         File root=new File(getExternalFilesDir(null),"sessions");
         new Thread(()->{
@@ -271,6 +293,7 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
                         @Override
                         public void onVisionError(String message) {
                             runOnUiThread(() -> {
+                                SessionRecorder current=session;if(current!=null)try{current.setLabel("unknown","vision_error");lastAutoLabel="unknown";}catch(IOException ignored){}
                                 detectionOverlay.clear();
                                 visionText.setText("视觉不可用：" + message);
                             });
@@ -286,7 +309,7 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
                                 SystemClock.elapsedRealtimeNanos());
                     }
                     VisionAnalyzer analyzer = visionAnalyzer;
-                    if (analyzer != null) analyzer.analyze(image);
+                    if (analyzer != null && !handTest) analyzer.analyze(image);
                     else image.close();
                 });
 
@@ -315,15 +338,18 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
             return;
         }
         if (cameraRecorder == null || finalizing) return;
-        if(!bleConnected || SystemClock.elapsedRealtimeNanos()-lastFrameNs>2_000_000_000L){Toast.makeText(this,"请先在设备页连接项圈并等待 IMU 数据",1).show();return;}
-        if(getExternalFilesDir(null).getUsableSpace()<200L*1024*1024){Toast.makeText(this,"存储不足，请至少留出 200 MB",1).show();return;}
+        if(!bleConnected || SystemClock.elapsedRealtimeNanos()-lastFrameNs>2_000_000_000L){Toast.makeText(this,"请先在设备页连接项圈并等待 IMU 数据",Toast.LENGTH_LONG).show();return;}
+        if(getExternalFilesDir(null).getUsableSpace()<200L*1024*1024){Toast.makeText(this,"存储不足，请至少留出 200 MB",Toast.LENGTH_LONG).show();return;}
         try {
             received = 0;
             firstFrameNs = 0;
             manualOverrideActive = false;
             lastAutoLabel = "unknown";
             lastCatSeenNs = 0;
-            session = new SessionRecorder(this);
+            if(!handTest&&catInput.getText().toString().trim().isEmpty()){Toast.makeText(this,"请填写猫 ID，或选择手持测试",Toast.LENGTH_LONG).show();return;}
+            session = new SessionRecorder(this,handTest,catInput.getText().toString().trim(),(mountInput.getText().toString().trim().isEmpty()?"unknown":mountInput.getText().toString().trim()),bleClient.epoch());
+            for(long[] p:bleClient.syncObservations())session.recordSync((int)p[0],p[1],p[2],p[3],p[4]);
+            testMode.setEnabled(false);catInput.setEnabled(false);mountInput.setEnabled(false);
             recordingStartNs=SystemClock.elapsedRealtimeNanos();
             activeLabelText.setText("视觉候选：无法判断 · 待复核");
             FileOutputOptions output = new FileOutputOptions.Builder(session.videoFile()).build();
@@ -348,26 +374,13 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
             if(session!=null)try{session.close("start_error");}catch(IOException ignored){}
             recording=null;
             Toast.makeText(this, "无法开始采集：" + error.getMessage(), Toast.LENGTH_LONG).show();
-            session = null;
+            session = null;testMode.setEnabled(true);catInput.setEnabled(true);mountInput.setEnabled(true);
         }
     }
 
     private void finishSession(String reason) {
-        SessionRecorder completed = session;
-        session = null;
-        recording = null;
-        finalizing=false;
-        timerText.setText("00:00 · 720p 视频 + 六轴 IMU");
-        recordButton.setText("开始采集");
-        if (completed != null) {
-            try {
-                completed.close(reason);
-                statusText.setText((reason.equals("user_stop")?"已保存：":"异常结束，已保存可用资料：") + completed.directory().getName());
-                if(!isFinishing()&&!isDestroyed()&&reason.equals("user_stop")){Intent intent=new Intent(this,ReviewActivity.class);intent.putExtra(ReviewActivity.EXTRA_SESSION_NAME,completed.directory().getName());startActivity(intent);}
-            } catch (IOException error) {
-                statusText.setText("会话保存不完整：" + error.getMessage());
-            }
-        }
+        SessionRecorder completed=session;savingDirectory=completed==null?null:completed.directory();session=null;recording=null;finalizing=true;statusText.setText("正在落盘，请稍候…");
+        new Thread(()->{String failure=null;try{if(completed!=null)completed.close(reason);}catch(IOException e){failure=e.getMessage();}final String error=failure;runOnUiThread(()->{savingDirectory=null;finalizing=false;testMode.setEnabled(true);catInput.setEnabled(true);mountInput.setEnabled(true);recordButton.setText("开始采集");timerText.setText("00:00 · 视频 + 六轴 IMU");statusText.setText(error!=null?"保存不完整："+error:reason.equals("user_stop")?"已保存，可复核":"异常结束，已保留可用资料");if(error==null&&completed!=null&&!isFinishing()&&!isDestroyed()&&reason.equals("user_stop")){Intent i=new Intent(this,ReviewActivity.class);i.putExtra(ReviewActivity.EXTRA_SESSION_NAME,completed.directory().getName());startActivity(i);}});},"pawlink-finalize").start();
     }
 
     private void selectLabel(String label) {
@@ -408,9 +421,7 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
             text = String.format(Locale.US, "视觉：猫 %.0f%% · 正在观察动作",
                     result.catScore * 100f);
         } else {
-            text = String.format(Locale.US, "视觉：猫 %.0f%% · 自动粗标 %s %.0f%%",
-                    result.catScore * 100f, result.suggestion,
-                    result.suggestionConfidence * 100f);
+            text = String.format(Locale.US, "猫检测 %.0f%% · 动作候选 %s",result.catScore*100f,result.suggestion);
         }
         runOnUiThread(() -> {
             detectionOverlay.setDetections(result.boxes, result.imageWidth,
@@ -430,8 +441,7 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
         String candidate = null;
         if ("rest".equals(result.suggestion) || "locomotion".equals(result.suggestion)) {
             candidate = result.suggestion;
-        } else if (!result.catVisible && lastCatSeenNs > 0
-                && result.elapsedTimeNs - lastCatSeenNs >= 2_000_000_000L) {
+        } else {
             candidate = "unknown";
         }
         if (candidate == null || candidate.equals(lastAutoLabel)) return;
@@ -487,17 +497,20 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
 
     @Override
     public void onConnected(boolean connected) {
-        if(bleConnected!=connected && session!=null)session.newEpoch(connected?"connected":"disconnected");
+
         bleConnected = connected;
         if(!connected){lastFrameNs=0;firstFrameNs=0;received=0;runOnUiThread(()->predictionText.setText("设备：连接中断，预测已过期"));}
         runOnUiThread(() -> connectButton.setText(connected ? "重新连接" : "连接项圈"));
     }
 
+    @Override public void onEpoch(int epoch,String reason){SessionRecorder s=session;if(s!=null)s.setEpoch(epoch,reason);}
+    @Override public void onSync(int epoch,long t1,long t2,long t3,long t4){boolean accepted=clock.observe(epoch,t1,t2,t3,t4);SessionRecorder s=session;if(s!=null)s.recordSync(epoch,t1,t2,t3,t4);ClockSync.Mapping m=clock.mapping(epoch);runOnUiThread(()->{if(accepted&&m!=null)statusText.setText("设备时钟已同步 · 往返估计误差 ±"+(m.uncertaintyNs/1_000_000)+" ms；视频需复核校准");});}
+
     @Override
     public void onFrame(ImuFrame frame, long receivedElapsedNs) {
         if(lastFrameNs==0)runOnUiThread(()->statusText.setText("项圈已就绪 · 视频与 IMU 可同步采集"));
         lastFrameNs=receivedElapsedNs;
-        if(lastDeviceMs>=0&&frame.deviceTimeMs<lastDeviceMs&&lastDeviceMs-frame.deviceTimeMs<0x80000000L&&session!=null)session.newEpoch("device_restart");
+
         lastDeviceMs=frame.deviceTimeMs;
         SessionRecorder current = session;
         if (current != null) current.recordImu(frame, receivedElapsedNs);
@@ -520,6 +533,7 @@ public final class MainActivity extends ComponentActivity implements BleClient.L
         bleClient.disconnect();
         if (visionAnalyzer != null) visionAnalyzer.close();
         cameraExecutor.shutdown();
+        fileExecutor.shutdown();
         super.onDestroy();
     }
 }

@@ -65,6 +65,9 @@ BLEStringCharacteristic predictionCharacteristic(
     "7e400004-b5a3-f393-e0a9-e50e24dcca9e", BLERead | BLENotify, 64);
 BLEUnsignedShortCharacteristic batteryVoltageCharacteristic(
     "7e400005-b5a3-f393-e0a9-e50e24dcca9e", BLERead | BLENotify);
+// Four-byte request nonce; 12-byte response nonce, receive millis, send millis.
+BLECharacteristic syncCharacteristic(
+    "7e400006-b5a3-f393-e0a9-e50e24dcca9e", BLEWrite | BLENotify, 12, false);
 BLEService batteryService("180F");
 BLEUnsignedCharCharacteristic batteryLevelCharacteristic(
     "2A19", BLERead | BLENotify);
@@ -457,6 +460,7 @@ void setup() {
     selfTestService.addCharacteristic(imuDataCharacteristic);
     selfTestService.addCharacteristic(predictionCharacteristic);
     selfTestService.addCharacteristic(batteryVoltageCharacteristic);
+    selfTestService.addCharacteristic(syncCharacteristic);
     BLE.addService(selfTestService);
     batteryService.addCharacteristic(batteryLevelCharacteristic);
     BLE.addService(batteryService);
@@ -487,15 +491,28 @@ void setup() {
 }
 
 void loop() {
-  const uint32_t now = millis();
   if (bleOk) {
     BLE.poll();
+    if (syncCharacteristic.written() && syncCharacteristic.valueLength() == 4) {
+      const uint32_t receivedMs = millis();
+      uint8_t request[4];
+      syncCharacteristic.readValue(request, sizeof(request));
+      uint8_t reply[12];
+      memcpy(reply, request, 4);
+      const uint32_t sentMs = millis();
+      for (uint8_t i = 0; i < 4; ++i) {
+        reply[4 + i] = (receivedMs >> (8 * i)) & 0xff;
+        reply[8 + i] = (sentMs >> (8 * i)) & 0xff;
+      }
+      syncCharacteristic.writeValue(reply, sizeof(reply));
+    }
     if (statusCharacteristic.written() &&
         statusCharacteristic.value() == kShutdownCommand) {
       enterSystemOff();
     }
   }
 
+  const uint32_t now = millis();
   if (now - lastStatusMs >= kStatusIntervalMs) {
     lastStatusMs = now;
     setLed(!ledOn);
@@ -512,17 +529,21 @@ void loop() {
   lastSampleMs = now;
 
   const uint32_t frameSequence = sequence++;
+  const uint32_t sampleBeginMs = millis();
   const float ax = imu.readFloatAccelX();
   const float ay = imu.readFloatAccelY();
   const float az = imu.readFloatAccelZ();
   const float gx = imu.readFloatGyroX();
   const float gy = imu.readFloatGyroY();
   const float gz = imu.readFloatGyroZ();
+  // Midpoint of the six register reads, rather than BLE send time.
+  // Sensor conversion age is not measured; do not claim hardware-trigger precision.
+  const uint32_t sampledMs = sampleBeginMs + (millis() - sampleBeginMs) / 2;
 
   Serial.print("DATA,");
   Serial.print(frameSequence);
   Serial.print(',');
-  Serial.print(now);
+  Serial.print(sampledMs);
   Serial.print(',');
   Serial.print(ax, 5);
   Serial.print(',');
@@ -538,7 +559,7 @@ void loop() {
 
   ImuFrame frame = {
       frameSequence,
-      now,
+      sampledMs,
       {scaledInt16(ax, 1000.0f), scaledInt16(ay, 1000.0f),
        scaledInt16(az, 1000.0f)},
       {scaledInt16(gx, 100.0f), scaledInt16(gy, 100.0f),

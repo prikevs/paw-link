@@ -8,6 +8,7 @@ Service UUID: `7e400001-b5a3-f393-e0a9-e50e24dcca9e`
 | IMU data | `0003` | Read, Notify | 20-byte binary frame |
 | Prediction | `0004` | Read, Notify | UTF-8: `action,margin,latency_us,window,source_label` |
 | Battery voltage | `0005` | Read, Notify | Little-endian `uint16`, millivolts |
+| Clock synchronization | `0006` | Write, Notify | 4-byte request / 12-byte response, little-endian |
 
 The IMU frame is little-endian and uses the following packed layout:
 
@@ -90,3 +91,40 @@ user LED, and enters `SYSTEMOFF`. Press Reset to boot again. This prototype
 command is not authenticated, so the Android UI should require explicit
 confirmation. A switch in series with battery positive remains the only true
 zero-standby-power off.
+
+## Clock synchronization (Capture 0.7.0)
+
+The original 20-byte IMU layout is unchanged. Device uptime at offset 4 is the
+midpoint of the six sensor register reads, captured before serialization and
+transmission. Sensor conversion age and inter-axis register-read skew are not
+hardware measured; this is not a hardware-triggered sample timestamp.
+
+Write a four-byte uint32 nonce to `0006`. Firmware consumes it immediately after
+`BLE.poll()` and responds via Notify with `<III`:
+
+| Offset | Type | Meaning |
+| ---: | --- | --- |
+| 0 | uint32 | Request nonce |
+| 4 | uint32 | Device millis when the request is consumed (`t2`) |
+| 8 | uint32 | Device millis immediately before response write (`t3`) |
+
+The host records monotonic `t1` immediately before the request write and `t4`
+at the notification callback, before dispatching processing to its worker.
+Net round trip is `(t4 - t1) - (t3 - t2)`. The midpoint pair estimates device
+clock offset; half the net round trip plus millisecond quantization is an
+uncertainty estimate, not a guarantee of symmetric transport.
+
+Capture performs five exchanges on connection and repeats every 30 seconds.
+Raw observations are saved in `sync.csv` with connection epoch. A minimum of
+three valid exchanges is needed. Delay, residual and drift checks determine
+whether the mapping can be used; drift fitting needs observations separated
+by at least 30 seconds. Disconnect/reconnect, device reboot and clock wrap
+start a new mapping epoch. Read responses on `0003` are not counted as new
+samples, avoiding duplicate cached frames.
+
+Device-to-host mapping does not establish video alignment by itself. Capture
+uses encoded video PTS for frame selection and at least three physical video /
+IMU correspondence points for alignment; Start callback time is only an initial
+browser reference. Training export records mapping, anchor residual and manual
+annotation uncertainty, and excludes uncalibrated spans. Original timestamps
+are never replaced with corrected values.

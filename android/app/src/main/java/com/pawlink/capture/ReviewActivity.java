@@ -1,389 +1,147 @@
 package com.pawlink.capture;
 
-import android.graphics.Color;
-import android.graphics.Insets;
-import android.media.MediaPlayer;
-import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
-import android.view.WindowInsets;
-import android.widget.Button;
-import android.widget.HorizontalScrollView;
-import android.widget.LinearLayout;
-import android.widget.MediaController;
-import android.widget.TextView;
-import android.widget.Toast;
-import android.widget.VideoView;
-
+import android.graphics.Bitmap;
+import android.media.*;
+import android.os.*;
+import android.widget.*;
 import androidx.activity.ComponentActivity;
-
-import org.json.JSONObject;
-
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
+import org.json.*;
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.*;
 
 public final class ReviewActivity extends ComponentActivity {
-    static final String EXTRA_SESSION_NAME = "session_name";
-    private static final String[] LABELS = {
-            "feed", "jump", "groom", "wash", "roll", "walk", "sleep", "unknown"
-    };
+    static final String EXTRA_SESSION_NAME="session_name";
+    private static final class Segment {
+        int start,end;String label,reason,candidateId="";boolean excluded,confirmed,contextConfirmed;
+        Segment(int s,int e,String l,boolean x,String r){start=s;end=e;label=l;excluded=x;reason=r;confirmed=true;}
+    }
+    private final List<ReviewQueue.Item> queue=new ArrayList<>();
+    private final Set<String> skippedCandidates=new HashSet<>();
+    private int previewStart,previewEnd;
+    private MediaPlayer playbackPlayer;private boolean seekingPlayback;
+    private Button previous,skip;private TextView annotationStatus;
+    private final List<Segment> segments=new ArrayList<>();private final List<Integer> framePts=new ArrayList<>();private final List<Integer> bookmarks=new ArrayList<>();
+    private final ExecutorService io=Executors.newSingleThreadExecutor();private final Handler handler=new Handler(Looper.getMainLooper());
+    private File dir;private JSONObject manifest;private ImuData data;private VideoAlignment alignment;private boolean handTest,busy,playing,loaded,loop,exportRaw,destroyed;
+    private int durationMs,selectedVideoMs,rangeStart,rangeEnd,playStart,playEnd,currentSegment=-1,candidateIndex=-1;
+    private volatile int decodeGeneration;
+    private long firstVideoPtsUs;
+    private long imuCursor;private JSONArray undo;private Set<String> undoSkipped;private File latestRevision;private MediaMetadataRetriever frames;
+    private VideoView video;private ImageView still;private ImuTimeline timeline;private TextView info,selection;private EditText startInput,endInput;private Spinner label,reason;private CheckBox excluded,contextChecked;private Button confirm,save,training,raw,play;
+    private String[] labels;
+    private static final String[] REASONS={"无","out_of_frame","occluded","identity_uncertain","imu_gap","sync_uncertain","collar_artifact","unusable"};
 
-    private static final class LabelEvent {
-        long elapsedNs;
-        final long wallMs;
-        String label;
-        String source;
-        boolean reviewed;
-        boolean excluded;
-        String reason="";
+    @Override protected void onCreate(Bundle state){super.onCreate(state);try{File root=new File(getExternalFilesDir(null),"sessions");String name=getIntent().getStringExtra(EXTRA_SESSION_NAME);dir=name==null?null:new File(root,name);if(dir==null||!dir.getCanonicalFile().getParentFile().equals(root.getCanonicalFile())||!dir.isDirectory())throw new IOException("无效记录");buildUi();io.execute(()->{try{manifest=new JSONObject(read(new File(dir,"manifest.json")));handTest=manifest.optString("capture_mode").equals("hand_test");data=ImuData.load(dir);frames=new MediaMetadataRetriever();frames.setDataSource(new File(dir,"video.mp4").getAbsolutePath());String d=frames.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);durationMs=Integer.parseInt(d);alignment=new VideoAlignment(manifest.optLong("video_started_elapsed_ns",manifest.getLong("started_elapsed_ns")));indexFrames();loadDraft();loadBookmarks();runOnUiThread(()->ready());}catch(Exception e){runOnUiThread(()->{toast("无法读取记录："+e.getMessage());finish();});}});}catch(Exception e){toast(e.getMessage());finish();}}
+    private void buildUi(){
+        LinearLayout root=CaptureUi.root(this);
+        LinearLayout header=row();header.addView(CaptureUi.title(this,"片段标注"),new LinearLayout.LayoutParams(0,-2,1));
+        header.addView(button("片段列表",v->chooseCandidate()));header.addView(button("已标注",v->chooseSegment()));root.addView(header);
+        info=CaptureUi.text(this,"正在准备待标片段…",13,CaptureUi.MUTED);root.addView(info);
+        annotationStatus=CaptureUi.text(this,"待标注",14,CaptureUi.INK);annotationStatus.setOnClickListener(v->{if(!loaded||busy)return;List<Integer> conflicts=overlaps();if(!conflicts.isEmpty())showOverlap(conflicts);else chooseSegment();});root.addView(annotationStatus);
+        FrameLayout frame=new FrameLayout(this);root.addView(frame,new LinearLayout.LayoutParams(-1,0,1));
+        video=new VideoView(this);still=new ImageView(this);still.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        frame.setBackgroundColor(android.graphics.Color.BLACK);frame.addView(video,new FrameLayout.LayoutParams(-1,-1));frame.addView(still,new FrameLayout.LayoutParams(-1,-1));
+        video.setOnPreparedListener(m->{playbackPlayer=m;m.setOnSeekCompleteListener(p->{if(!playing||!seekingPlayback)return;seekingPlayback=false;selectedVideoMs=p.getCurrentPosition();timeline.position(selectedVideoMs);updateSelection();still.setVisibility(android.view.View.GONE);p.start();handler.removeCallbacks(watcher);handler.post(watcher);});if(playing)seekPlaybackStart();});
+        video.setOnCompletionListener(m->{if(!playing)return;if(loop)seekPlaybackStart();else{stop();seekFrame(Math.max(0,playEnd-1));}});
+        video.setOnErrorListener((m,w,e)->{toast("视频播放失败，可点击导出保存原始资料");return true;});
+        selection=CaptureUi.text(this,"",13,CaptureUi.INK);root.addView(selection);
+        timeline=new ImuTimeline(this);timeline.rangeListener((s,e)->{if(busy)return;stop();rangeStart=s;rangeEnd=e;contextChecked.setChecked(false);rangeFields();});root.addView(timeline,new LinearLayout.LayoutParams(-1,dp(100)));
+        LinearLayout playback=row();playback.addView(button("← 前面 2 秒",v->expandPreview(-1)),weight());play=button("播放选段",v->toggle());playback.addView(play,weight());playback.addView(button("后面 2 秒 →",v->expandPreview(1)),weight());root.addView(playback);
+        LinearLayout boundary=row();boundary.addView(button("上一帧",v->step(-1)),weight());boundary.addView(button("设为起点",v->setBoundary(true)),weight());boundary.addView(button("设为终点",v->setBoundary(false)),weight());boundary.addView(button("下一帧",v->step(1)),weight());root.addView(boundary);
+        label=new Spinner(this);label.setContentDescription("选择本段行为");root.addView(label);
+        LinearLayout actions=row();previous=button("上一段",v->navigate(-1));skip=button("跳过",v->skipCandidate());confirm=CaptureUi.button(this,"确认并下一段",true);confirm.setTextSize(13);confirm.setOnClickListener(v->confirmRange());actions.addView(previous,new LinearLayout.LayoutParams(0,-2,1));actions.addView(skip,new LinearLayout.LayoutParams(0,-2,1));actions.addView(confirm,new LinearLayout.LayoutParams(0,-2,2));root.addView(actions);
+        LinearLayout quick=row();quick.addView(button("播放前后",v->beginPlayback(previewStart,previewEnd)),weight());quick.addView(button("播放全片",v->beginPlayback(0,durationMs,false)),weight());quick.addView(button("新增片段",v->newRange()),weight());root.addView(quick);
+        HorizontalScrollView tools=new HorizontalScrollView(this);tools.setHorizontalScrollBarEnabled(true);tools.setScrollbarFadingEnabled(false);LinearLayout strip=row();
+        strip.addView(button("调整时间",v->editTimes()));strip.addView(button("排除",v->excludeRange()));strip.addView(button("撤销",v->undo()));strip.addView(button("拆分",v->split()));strip.addView(button("合并",v->merge()));strip.addView(button("同步",v->syncMenu()));strip.addView(button("保存",v->saveVersion(false)));strip.addView(button("导出",v->exportMenu()));strip.addView(button("书签",v->chooseBookmark()));strip.addView(button("事件预览",v->previewEvent()));tools.addView(strip);root.addView(tools);
+        label.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener(){public void onItemSelected(android.widget.AdapterView<?> parent,android.view.View view,int position,long id){updateAnnotationStatus();}public void onNothingSelected(android.widget.AdapterView<?> parent){}});
+        // Precise input and exclusion state are edited through named controls.
 
-        LabelEvent(long elapsedNs, long wallMs, String label, String source) {
-            this.elapsedNs = elapsedNs;
-            this.wallMs = wallMs;
-            this.label = label;
-            this.source = source;
+        startInput=new EditText(this);endInput=new EditText(this);reason=new Spinner(this);reason.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,REASONS));excluded=new CheckBox(this);contextChecked=new CheckBox(this);
+        setContentView(root);setBusy(true);
+    }
+    private void syncMenu(){if(!loaded||busy)return;new android.app.AlertDialog.Builder(this).setTitle("同步与数据").setItems(new String[]{"查看同步与数据状态","添加视频 / IMU 校准点","查看或重置校准点"},(d,n)->{if(n==0)new android.app.AlertDialog.Builder(this).setTitle("同步与数据状态").setMessage((handTest?"手持测试，不进入猫训练集":"猫："+manifest.optString("cat_id","未知"))+"\n"+(alignment.valid?"校准残差 "+alignment.residualNs/1_000_000+" ms，合计估计误差 ±"+alignment.uncertainty(data.syncUncertaintyNs)/1_000_000+" ms":"视频尚未校准。至少三点，跨度 ≥10 秒")+"\n"+(data.allMapped?"设备时钟映射可用":"部分 IMU 无时钟映射，不能训练导出")+"\n\n点选 IMU 事件，再逐帧选择视频中同一事件，添加对应点。").setPositiveButton("知道了",null).show();else if(n==1)calibrate();else showAnchors();}).show();}
+    private void exportMenu(){if(!loaded||busy)return;new android.app.AlertDialog.Builder(this).setTitle("保存与导出").setItems(new String[]{"保存复核版本","导出训练资料","导出全部原始资料"},(d,n)->{if(n==0)saveVersion(false);else export(n==2);}).show();}
+    private void editTimes(){if(!loaded||busy)return;LinearLayout form=CaptureUi.column(this);EditText a=new EditText(this),b=new EditText(this);a.setInputType(android.text.InputType.TYPE_CLASS_NUMBER|android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL);b.setInputType(a.getInputType());a.setText(format(rangeStart));b.setText(format(rangeEnd));form.addView(CaptureUi.text(this,"起点（秒）",14,CaptureUi.INK));form.addView(a);form.addView(CaptureUi.text(this,"终点（秒）",14,CaptureUi.INK));form.addView(b);new android.app.AlertDialog.Builder(this).setTitle("精确调整时间").setView(form).setNegativeButton("取消",null).setPositiveButton("应用",(d,w)->{try{double start=Double.parseDouble(a.getText().toString()),end=Double.parseDouble(b.getText().toString());if(!Double.isFinite(start)||!Double.isFinite(end)||start<0||end*1000>durationMs||end<=start)throw new IllegalArgumentException();rangeStart=(int)Math.round(start*1000);rangeEnd=(int)Math.round(end*1000);contextChecked.setChecked(false);setPreview(Math.max(0,rangeStart-2000),Math.min(durationMs,rangeEnd+2000));rangeFields();seekFrame(rangeStart);}catch(Exception e){toast("请输入视频范围内的有效起止时间");}}).show();}
+    private void excludeRange(){if(!loaded||busy)return;String[] names={"出画","遮挡","猫身份不确定","IMU 缺失","同步不确定","项圈异常","其他不可用"};new android.app.AlertDialog.Builder(this).setTitle("排除原因").setItems(names,(d,n)->{excluded.setChecked(true);reason.setSelection(n+1);label.setSelection(labels.length-1);confirmRange();}).setNegativeButton("取消",null).show();}
+    private void newRange(){if(!loaded||busy)return;stop();candidateIndex=-1;currentSegment=-1;rangeStart=Math.max(0,Math.min(selectedVideoMs,durationMs-1));rangeEnd=Math.min(durationMs,rangeStart+2000);excluded.setChecked(false);reason.setSelection(0);contextChecked.setChecked(false);label.setSelection(0);setPreview(0,durationMs);rangeFields();seekFrame(rangeStart);updateInfo();}
+    private void setBoundary(boolean start){if(!loaded||busy)return;if(start&&selectedVideoMs>=rangeEnd||!start&&selectedVideoMs<=rangeStart){toast("起点须早于终点");return;}if(start)rangeStart=selectedVideoMs;else rangeEnd=selectedVideoMs;contextChecked.setChecked(false);rangeFields();}
+    private void setPreview(int start,int end){previewStart=Math.max(0,start);previewEnd=Math.min(durationMs,end);timeline.viewport(previewStart,previewEnd);updateSelection();}
+    private void expandPreview(int side){if(!loaded||busy)return;stop();if(side<0)previewStart=Math.max(0,previewStart-2000);else previewEnd=Math.min(durationMs,previewEnd+2000);timeline.viewport(previewStart,previewEnd);seekFrame(side<0?previewStart:Math.max(previewStart,previewEnd-1));updateSelection();}
+    private void beginPlayback(int start,int end){beginPlayback(start,end,true);}
+    private void beginPlayback(int start,int end,boolean repeat){if(!loaded||busy||end<=start)return;stop();playing=true;loop=repeat;playStart=start;playEnd=end;selectedVideoMs=start;timeline.position(start);updateSelection();play.setText("暂停");seekPlaybackStart();}
+    private void seekPlaybackStart(){if(!playing||playbackPlayer==null)return;handler.removeCallbacks(watcher);seekingPlayback=true;if(playbackPlayer.isPlaying())playbackPlayer.pause();playbackPlayer.seekTo((long)playStart,MediaPlayer.SEEK_CLOSEST);}
+    private void updateSelection(){if(selection==null)return;selection.setText("标注 "+format(rangeStart)+"–"+format(rangeEnd)+" 秒 · 当前 "+format(selectedVideoMs)+" 秒\n预览 "+format(previewStart)+"–"+format(previewEnd)+" 秒；拖动蓝色端点调整边界");updateAnnotationStatus();}
+    private Set<String> handled(){Set<String> result=new HashSet<>();for(ReviewQueue.Item q:queue){if(skippedCandidates.contains(q.id)){result.add(q.id);continue;}int covered=q.startMs;for(Segment s:segments){if(!s.confirmed)continue;if(q.id.equals(s.candidateId)){covered=q.endMs;break;}if(s.start<=covered&&s.end>covered)covered=s.end;if(covered>=q.endMs)break;}if(covered>=q.endMs)result.add(q.id);}return result;}
+    private void rebuildQueue(){queue.clear();queue.addAll(ReviewQueue.build(data,alignment,durationMs));}
+    private void selectCandidate(int index){if(index<0||index>=queue.size())return;stop();candidateIndex=index;ReviewQueue.Item q=queue.get(index);currentSegment=-1;rangeStart=q.startMs;rangeEnd=q.endMs;excluded.setChecked(false);reason.setSelection(0);contextChecked.setChecked(false);label.setSelection(0);for(int i=0;i<segments.size();i++){Segment s=segments.get(i);if(q.id.equals(s.candidateId)||s.confirmed&&s.start<=q.startMs&&s.end>=q.endMs){currentSegment=i;rangeStart=s.start;rangeEnd=s.end;excluded.setChecked(s.excluded);reason.setSelection(Math.max(0,Arrays.asList(REASONS).indexOf(s.reason)));contextChecked.setChecked(s.contextConfirmed);label.setSelection(Math.max(0,Arrays.asList(labels).indexOf(s.label)));break;}}
+        imuCursor=q.imuStartNs;timeline.cursor(imuCursor);setPreview(Math.max(0,rangeStart-ReviewQueue.DEFAULT_MARGIN_MS),Math.min(durationMs,rangeEnd+ReviewQueue.DEFAULT_MARGIN_MS));rangeFields();seekFrame(previewStart);updateInfo();beginPlayback(previewStart,previewEnd);
+    }
+    private void navigate(int direction){if(!loaded||busy||queue.isEmpty())return;selectCandidate(Math.max(0,Math.min(queue.size()-1,candidateIndex+direction)));}
+    private void nextPending(){int next=ReviewQueue.firstPending(queue,handled(),candidateIndex);if(next>=0)selectCandidate(next);else{stop();updateInfo();toast("所有 IMU 候选已处理，可点击已标注复核或新增片段");}}
+    private void skipCandidate(){if(!loaded||busy)return;if(candidateIndex<0){toast("请先选择待标片段");return;}checkpoint();skippedCandidates.add(queue.get(candidateIndex).id);persist(()->nextPending());}
+    private void indexFrames()throws IOException{MediaExtractor extractor=new MediaExtractor();try{extractor.setDataSource(new File(dir,"video.mp4").getAbsolutePath());for(int i=0;i<extractor.getTrackCount();i++){MediaFormat format=extractor.getTrackFormat(i);if(format.getString(MediaFormat.KEY_MIME).startsWith("video/")){extractor.selectTrack(i);firstVideoPtsUs=extractor.getSampleTime();while(extractor.getSampleTime()>=0){long us=extractor.getSampleTime();framePts.add((int)((us-firstVideoPtsUs)/1000));if(!extractor.advance())break;}break;}}}finally{extractor.release();}Collections.sort(framePts);if(framePts.isEmpty())throw new IOException("没有可解码的视频帧");}
+    private void ready(){if(destroyed)return;String[] choices=handTest?new String[]{"static_test","translation_test","rotation_test","shake_test","unknown"}:CaptureUi.LABELS;labels=new String[choices.length+1];labels[0]="";System.arraycopy(choices,0,labels,1,choices.length);String[] names=new String[labels.length];names[0]="选择本段行为";for(int i=1;i<labels.length;i++)names[i]=display(labels[i]);label.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,names));video.setVideoPath(new File(dir,"video.mp4").getAbsolutePath());timeline.load(data,alignment,durationMs,(ms,ns)->{if(busy)return;imuCursor=ns;seekFrame(ms);});loaded=true;setBusy(false);rebuildQueue();int first=ReviewQueue.firstPending(queue,handled(),-1);if(first>=0)selectCandidate(first);else if(!queue.isEmpty()){selectCandidate(0);stop();updateInfo();}else{rangeStart=0;rangeEnd=Math.min(2000,durationMs);setPreview(0,Math.min(durationMs,6000));rangeFields();seekFrame(0);updateInfo();}}
+    private String display(String s){switch(s){case "static_test":return "测试：静置";case "translation_test":return "测试：平移";case "rotation_test":return "测试：旋转";case "shake_test":return "测试：轻晃";default:return CaptureUi.name(s);}}
+    private void setBusy(boolean b){busy=b;if(timeline!=null)timeline.setEnabled(!b);for(Button x:new Button[]{confirm,previous,skip,play})if(x!=null)x.setEnabled(!b);}
+    private void stop(){playing=false;seekingPlayback=false;handler.removeCallbacks(watcher);if(video!=null)video.pause();if(play!=null)play.setText("播放选段");}
+    private boolean readRange(){try{rangeStart=Integer.parseInt(startInput.getText().toString());rangeEnd=Integer.parseInt(endInput.getText().toString());if(rangeStart<0||rangeEnd>durationMs||rangeEnd<=rangeStart)throw new IllegalArgumentException();timeline.range(rangeStart,rangeEnd);return true;}catch(Exception e){toast("起止点须在视频范围内，且终点大于起点");return false;}}
+    private void toggle(){if(!loaded||busy)return;if(playing){stop();seekFrame(video.getCurrentPosition());return;}beginPlayback(rangeStart,rangeEnd);}
+    private final Runnable watcher=new Runnable(){public void run(){if(!playing||seekingPlayback)return;selectedVideoMs=video.getCurrentPosition();timeline.position(selectedVideoMs);updateSelection();if(selectedVideoMs>=playEnd-20){if(loop)seekPlaybackStart();else{stop();seekFrame(Math.max(0,playEnd-1));}return;}handler.postDelayed(this,20);}};
+    private void previewEvent(){if(!loaded||busy||!readRange())return;String name=labels[label.getSelectedItemPosition()];if(!name.equals("jump")&&!name.equals("roll")){toast("先选择跳跃或打滚，再标出完整动作区间");return;}List<ImuData.Window> windows=ImuData.windows(alignment.host(rangeStart),alignment.host(rangeEnd),name,alignment.host(0),alignment.host(durationMs));if(windows.isEmpty()){toast("录像没有足够的事件上下文");return;}ImuData.Window w=windows.get(0);beginPlayback(Math.max(0,alignment.video(w.start)),Math.min(durationMs,alignment.video(w.end)));}
+    private void step(int direction){if(!loaded||busy)return;int i=Collections.binarySearch(framePts,selectedVideoMs);if(i<0)i=-i-1+(direction<0?-1:0);else i+=direction;i=Math.max(0,Math.min(framePts.size()-1,i));seekFrame(framePts.get(i));}
+    private void seekFrame(int ms){if(!loaded||busy)return;stop();selectedVideoMs=Math.max(0,Math.min(durationMs-1,ms));int index=Collections.binarySearch(framePts,selectedVideoMs);if(index<0){index=-index-1;if(index>=framePts.size())index=framePts.size()-1;else if(index>0&&selectedVideoMs-framePts.get(index-1)<=framePts.get(index)-selectedVideoMs)index--;}selectedVideoMs=framePts.get(index);timeline.position(selectedVideoMs);still.setVisibility(android.view.View.VISIBLE);int generation=++decodeGeneration;int requested=selectedVideoMs;updateSelection();io.execute(()->{try{if(generation!=decodeGeneration||destroyed)return;Bitmap b=frames.getFrameAtTime(firstVideoPtsUs+requested*1000L,MediaMetadataRetriever.OPTION_CLOSEST);runOnUiThread(()->{if(!destroyed&&generation==decodeGeneration)still.setImageBitmap(b);else if(b!=null)b.recycle();});}catch(Exception e){runOnUiThread(()->toast("帧解码失败："+e.getMessage()));}});}
+    private void rangeFields(){updateSelection();timeline.range(rangeStart,rangeEnd);startInput.setText(""+rangeStart);endInput.setText(""+rangeEnd);}
+    private String candidateState(ReviewQueue.Item q,Set<String> done){if(skippedCandidates.contains(q.id))return "已跳过";for(Segment s:segments){if(q.id.equals(s.candidateId)||s.confirmed&&s.start<=q.startMs&&s.end>=q.endMs)return (s.excluded?"已排除":s.confirmed?"已标注":"待重新确认")+" · "+display(s.label);}return done.contains(q.id)?"已处理（多个已保存区间）":"待标注";}
+    private void chooseCandidate(){if(!loaded||busy)return;if(queue.isEmpty()){toast("未发现明显活动，可点击新增片段");return;}Set<String> done=handled();String[] names=new String[queue.size()];for(int i=0;i<names.length;i++){ReviewQueue.Item q=queue.get(i);names[i]=(i+1)+" · "+format(q.startMs)+"–"+format(q.endMs)+" 秒 · "+candidateState(q,done);}new android.app.AlertDialog.Builder(this).setTitle("IMU 预选片段").setItems(names,(d,n)->selectCandidate(n)).show();}
+    private void chooseSegment(){if(!loaded||busy)return;if(segments.isEmpty()){toast("尚未确认区间");return;}String[] names=new String[segments.size()];for(int i=0;i<names.length;i++){Segment s=segments.get(i);names[i]=format(s.start)+"–"+format(s.end)+" 秒 · "+display(s.label)+(s.excluded?" · 排除":s.confirmed?" · 已确认":" · 待重新确认");}new android.app.AlertDialog.Builder(this).setTitle("人工标注区间").setItems(names,(d,n)->selectSegment(n)).show();}
+    private void selectSegment(int n){candidateIndex=-1;currentSegment=n;Segment s=segments.get(n);rangeStart=s.start;rangeEnd=s.end;rangeFields();label.setSelection(Math.max(0,Arrays.asList(labels).indexOf(s.label)));excluded.setChecked(s.excluded);contextChecked.setChecked(s.contextConfirmed);reason.setSelection(Math.max(0,Arrays.asList(REASONS).indexOf(s.reason)));setPreview(Math.max(0,rangeStart-2000),Math.min(durationMs,rangeEnd+2000));seekFrame(previewStart);updateInfo();beginPlayback(previewStart,previewEnd);}
+    private void chooseBookmark(){if(!loaded||busy)return;if(bookmarks.isEmpty()){toast("没有书签");return;}String[] a=new String[bookmarks.size()];for(int i=0;i<a.length;i++)a[i]=format(bookmarks.get(i))+" 秒";new android.app.AlertDialog.Builder(this).setTitle("书签").setItems(a,(d,n)->{candidateIndex=-1;currentSegment=-1;rangeStart=Math.max(0,bookmarks.get(n)-1000);rangeEnd=Math.min(durationMs,bookmarks.get(n)+1000);setPreview(Math.max(0,rangeStart-2000),Math.min(durationMs,rangeEnd+2000));rangeFields();seekFrame(bookmarks.get(n));updateInfo();}).show();}
+    private String segmentSummary(Segment s){return format(s.start)+"–"+format(s.end)+" 秒 · "+display(s.label)+(s.excluded?" · 已排除":s.confirmed?" · 已标注":" · 待重新确认");}
+    private List<Integer> overlaps(){List<Integer> result=new ArrayList<>();for(int n=0;n<segments.size();n++){Segment s=segments.get(n);if(n!=currentSegment&&rangeStart<s.end&&rangeEnd>s.start)result.add(n);}return result;}
+    private void showOverlap(List<Integer> conflicts){String[] names=new String[conflicts.size()];for(int n=0;n<names.length;n++){Segment s=segments.get(conflicts.get(n));names[n]=segmentSummary(s)+"\n重叠 "+format(Math.max(rangeStart,s.start))+"–"+format(Math.min(rangeEnd,s.end))+" 秒";}new android.app.AlertDialog.Builder(this).setTitle("与已有标注重叠 · 点击修改原标注").setItems(names,(d,n)->selectSegment(conflicts.get(n))).setNegativeButton("返回调整边界",null).show();}
+    private void updateAnnotationStatus(){if(!loaded||annotationStatus==null)return;String text;int color=CaptureUi.MUTED;if(currentSegment>=0&&currentSegment<segments.size()){Segment s=segments.get(currentSegment);boolean changed=rangeStart!=s.start||rangeEnd!=s.end||labels!=null&&label.getSelectedItemPosition()>=0&&!s.label.equals(labels[label.getSelectedItemPosition()]);text=segmentSummary(s)+(changed?" · 修改尚未保存":"");color=s.excluded?0xffb95b51:s.confirmed?CaptureUi.GREEN:CaptureUi.MUTED;confirm.setText("保存修改");}else{confirm.setText("确认并下一段");boolean skipped=candidateIndex>=0&&skippedCandidates.contains(queue.get(candidateIndex).id);boolean covered=candidateIndex>=0&&handled().contains(queue.get(candidateIndex).id);text=skipped?"已跳过 · 可重新选择行为标注":covered?"已标注 · 由多个已保存区间覆盖":"待标注 · 尚未保存";if(covered&&!skipped)color=CaptureUi.GREEN;}List<Integer> conflicts=overlaps();if(!conflicts.isEmpty()){Segment s=segments.get(conflicts.get(0));text="重叠："+segmentSummary(s)+(conflicts.size()>1?" 等 "+conflicts.size()+" 段":"")+" · 点击查看";color=0xffb95b51;}annotationStatus.setText(text);annotationStatus.setTextColor(color);}
+    private void confirmRange(){if(!loaded||busy||!readRange())return;String chosen=labels[label.getSelectedItemPosition()];if(chosen.isEmpty()){toast("请先选择本段行为，或点击排除");return;}if(!excluded.isChecked()&&(chosen.equals("jump")||chosen.equals("roll"))&&!contextChecked.isChecked()){new android.app.AlertDialog.Builder(this).setTitle("确认短事件").setMessage("请确认起跳至落地或打滚过程完整，并已查看前后背景。背景不会被标成跳跃或打滚。").setNegativeButton("再看前后视频",(d,w)->previewEvent()).setPositiveButton("动作与背景已核对",(d,w)->{contextChecked.setChecked(true);confirmRange();}).show();return;}String detected=data.quality(alignment.host(rangeStart),alignment.host(rangeEnd));if(!detected.isEmpty())toast("本区间数据质量："+detected+"，将不生成训练窗口");List<Integer> conflicts=overlaps();if(!conflicts.isEmpty()){stop();showOverlap(conflicts);return;}checkpoint();String r=REASONS[reason.getSelectedItemPosition()];boolean x=excluded.isChecked();Segment s=new Segment(rangeStart,rangeEnd,labels[label.getSelectedItemPosition()],x,r.equals("无")?(x?"unusable":""):r);s.contextConfirmed=contextChecked.isChecked();s.candidateId=candidateIndex>=0?queue.get(candidateIndex).id:currentSegment>=0?segments.get(currentSegment).candidateId:"";if(!s.reason.isEmpty())s.excluded=true;if(currentSegment>=0)segments.set(currentSegment,s);else segments.add(s);segments.sort(Comparator.comparingInt(a->a.start));currentSegment=segments.indexOf(s);persist(()->{updateInfo();if(candidateIndex>=0)nextPending();else toast("区间已确认并保存");});}
+    private void split(){if(!loaded||busy||currentSegment<0){toast("先选择已标区间");return;}Segment s=segments.get(currentSegment);int p=selectedVideoMs;if(p<=s.start||p>=s.end){toast("请逐帧定位到区间内部");return;}checkpoint();Segment right=new Segment(p,s.end,s.label,s.excluded,s.reason);right.confirmed=false;s.candidateId="";s.end=p;s.confirmed=false;s.contextConfirmed=false;segments.add(currentSegment+1,right);persist(()->{updateInfo();selectSegment(currentSegment+1);});}
+    private void merge(){if(!loaded||busy||currentSegment<0||currentSegment+1>=segments.size()){toast("先选择可合并的区间");return;}Segment a=segments.get(currentSegment),b=segments.get(currentSegment+1);checkpoint();a.end=b.end;a.candidateId="";a.confirmed=false;a.contextConfirmed=false;a.excluded|=b.excluded;if(!b.reason.isEmpty())a.reason=b.reason;segments.remove(currentSegment+1);persist(()->{updateInfo();selectSegment(currentSegment);});}
+    private void checkpoint(){try{undo=segmentJson();undoSkipped=new HashSet<>(skippedCandidates);}catch(Exception e){toast(e.getMessage());}}
+    private void undo(){if(busy||undo==null)return;try{restoreSegments(undo);if(undoSkipped!=null){skippedCandidates.clear();skippedCandidates.addAll(undoSkipped);}undo=null;currentSegment=-1;persist(this::updateInfo);}catch(Exception e){toast(e.getMessage());}}
+    private void calibrate(){if(!loaded||busy)return;if(imuCursor==0){toast("先点选时间轴上的 IMU 事件，再逐帧定位视频中的同一事件");return;}LinearLayout form=CaptureUi.column(this);form.addView(CaptureUi.text(this,"对应视频 "+selectedVideoMs+" ms 与所选 IMU 时刻。请使用同一物理事件；不同事件会导致错误对齐。",14,CaptureUi.INK));EditText error=new EditText(this);error.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);error.setText("50");form.addView(CaptureUi.text(this,"人工定位误差上限（ms，按视频帧率和可见性判断）",12,CaptureUi.MUTED));form.addView(error);new android.app.AlertDialog.Builder(this).setTitle("添加视频 / IMU 对应点").setView(form).setNegativeButton("取消",null).setPositiveButton("添加",(d,w)->{try{int uncertainty=Integer.parseInt(error.getText().toString());if(uncertainty<1||uncertainty>1000)throw new IllegalArgumentException();alignment.anchors.add(new VideoAlignment.Anchor(selectedVideoMs,imuCursor));alignment.annotationErrorNs=Math.max(alignment.annotationErrorNs,uncertainty*1_000_000L);alignment.fit();for(Segment s:segments){s.confirmed=false;s.contextConfirmed=false;}persist(()->{rebuildQueue();candidateIndex=-1;timeline.invalidate();updateInfo();});}catch(Exception e){toast("请输入 1–1000 ms 的定位误差");}}).show();}
+    private void showAnchors(){if(!loaded||busy)return;StringBuilder b=new StringBuilder("训练仅使用校准点覆盖范围内的片段。\n");for(VideoAlignment.Anchor a:alignment.anchors)b.append(a.videoMs).append(" ms ↔ ").append(a.hostNs).append(" ns\n");new android.app.AlertDialog.Builder(this).setTitle("同步校准点").setMessage(b.length()==0?"尚无校准点":b.toString()).setNegativeButton("关闭",null).setPositiveButton("清除并重新校准",(d,w)->{alignment=new VideoAlignment(manifest.optLong("video_started_elapsed_ns",manifest.optLong("started_elapsed_ns")));for(Segment s:segments){s.confirmed=false;s.contextConfirmed=false;}timeline.load(data,alignment,durationMs,(ms,ns)->{if(busy)return;imuCursor=ns;seekFrame(ms);});rebuildQueue();candidateIndex=-1;setPreview(0,durationMs);persist(this::updateInfo);}).show();}
+    private void updateInfo(){if(!loaded)return;List<ImuTimeline.Annotation> a=new ArrayList<>();for(Segment s:segments)a.add(new ImuTimeline.Annotation(s.start,s.end,display(s.label),s.excluded,s.confirmed));timeline.annotations(a);Set<String> done=handled();String progress=queue.isEmpty()?"未发现明显活动，可手动新增片段":candidateIndex>=0?"片段 "+(candidateIndex+1)+" / "+queue.size():"手动标注";info.setText(progress+" · 已处理 "+done.size()+" / "+queue.size()+(handTest?" · 手持测试":alignment.valid?"":" · 对齐待校准"));previous.setEnabled(!busy&&candidateIndex>0);skip.setEnabled(!busy&&candidateIndex>=0);updateSelection();}
+    private JSONArray segmentJson()throws JSONException{JSONArray a=new JSONArray();for(Segment s:segments){JSONObject j=new JSONObject();j.put("start_video_ms",s.start);j.put("end_video_ms",s.end);j.put("label",s.label);j.put("candidate_id",s.candidateId);j.put("confirmed",s.confirmed);j.put("context_confirmed",s.contextConfirmed);j.put("excluded",s.excluded);j.put("reason",s.reason);a.put(j);}return a;}
+    private void restoreSegments(JSONArray a)throws JSONException{segments.clear();for(int i=0;i<a.length();i++){JSONObject j=a.getJSONObject(i);Segment s=new Segment(j.getInt("start_video_ms"),j.getInt("end_video_ms"),j.getString("label"),j.optBoolean("excluded"),j.optString("reason"));s.candidateId=j.optString("candidate_id");s.confirmed=j.optBoolean("confirmed");s.contextConfirmed=j.optBoolean("context_confirmed");segments.add(s);}segments.sort(Comparator.comparingInt(s->s.start));}
+    private JSONObject draft()throws JSONException{JSONObject j=new JSONObject();j.put("schema_version",3);j.put("skipped_candidate_ids",new JSONArray(skippedCandidates));j.put("encoded_first_pts_us",firstVideoPtsUs);j.put("taxonomy_version","pawlink-actions-v1");j.put("capture_mode",handTest?"hand_test":"cat");j.put("reviewed_wall_ms",System.currentTimeMillis());j.put("video_reference_ns",alignment.referenceNs);j.put("nanos_per_video_ms",alignment.nanosPerMs);j.put("residual_ns",alignment.residualNs);j.put("annotation_uncertainty_ns",alignment.annotationErrorNs);j.put("clock_uncertainty_ns",data.syncUncertaintyNs);j.put("sync_method","device_roundtrip_and_physical_video_anchors");j.put("segments",segmentJson());JSONArray a=new JSONArray();for(VideoAlignment.Anchor p:alignment.anchors){JSONObject x=new JSONObject();x.put("video_ms",p.videoMs);x.put("host_ns",p.hostNs);a.put(x);}j.put("anchors",a);return j;}
+    private void loadDraft()throws Exception{File f=new File(dir,"review-v3.json");if(f.isFile()){JSONObject j=new JSONObject(read(f));restoreSegments(j.getJSONArray("segments"));JSONArray skipped=j.optJSONArray("skipped_candidate_ids");if(skipped!=null)for(int i=0;i<skipped.length();i++)skippedCandidates.add(skipped.getString(i));alignment.annotationErrorNs=j.optLong("annotation_uncertainty_ns",50_000_000L);JSONArray a=j.optJSONArray("anchors");if(a!=null)for(int i=0;i<a.length();i++){JSONObject x=a.getJSONObject(i);alignment.anchors.add(new VideoAlignment.Anchor(x.getLong("video_ms"),x.getLong("host_ns")));}alignment.fit();}else{File old=new File(dir,"review-v2.json");if(old.isFile()){JSONObject j=new JSONObject(read(old));long reference=j.optLong("video_reference_ns",alignment.referenceNs);JSONArray a=j.getJSONArray("segments");for(int i=0;i<a.length();i++){JSONObject x=a.getJSONObject(i);int s=(int)((x.getLong("elapsed_ns")-reference)/1_000_000L),e=i+1<a.length()?(int)((a.getJSONObject(i+1).getLong("elapsed_ns")-reference)/1_000_000L):durationMs;if(e>0&&s<durationMs){Segment seg=new Segment(Math.max(0,s),Math.min(durationMs,e),x.getString("label"),x.optBoolean("excluded"),x.optString("reason"));seg.confirmed=false;segments.add(seg);}}}}}
+    private void loadBookmarks()throws IOException{File f=new File(dir,"evidence.csv");if(!f.exists())return;try(BufferedReader r=new BufferedReader(new FileReader(f))){String l;while((l=r.readLine())!=null){String[] a=l.split(",",4);if(a.length==4&&a[2].equals("bookmark"))bookmarks.add(alignment.video(Long.parseLong(a[0])));}}}
+    private void persist(Runnable done){try{String json=draft().toString(2);setBusy(true);io.execute(()->{try{atomic(new File(dir,"review-v3.json"),json);runOnUiThread(()->{setBusy(false);done.run();});}catch(Exception e){runOnUiThread(()->{setBusy(false);toast("保存失败："+e.getMessage()+"，当前修改尚未落盘，请重试保存");});}});}catch(Exception e){toast(e.getMessage());}}
+    private void saveVersion(boolean forExport){if(!loaded||busy)return;try{String json=draft().toString(2);List<Segment> copy=new ArrayList<>();for(Segment s:segments){Segment x=new Segment(s.start,s.end,s.label,s.excluded,s.reason);x.confirmed=s.confirmed;x.contextConfirmed=s.contextConfirmed;x.candidateId=s.candidateId;copy.add(x);}setBusy(true);io.execute(()->{File revision=null;try{atomic(new File(dir,"review-v3.json"),json);revision=new File(new File(dir,"reviews"),"revision-"+UUID.randomUUID());if(!revision.mkdirs())throw new IOException("无法创建版本");atomic(new File(revision,"review.json"),json);int windows=writeTraining(revision,copy);latestRevision=revision;runOnUiThread(()->{setBusy(false);updateInfo();if(forExport&&windows>0)launchExport(false);else toast("版本已保存 · 可训练窗口 "+windows+(handTest?"（测试数据不进入猫训练）":windows==0?"；请检查确认状态、质量、校准覆盖范围及短事件背景":""));});}catch(Exception e){runOnUiThread(()->{setBusy(false);toast("保存失败："+e.getMessage());});}});}catch(Exception e){toast(e.getMessage());}}
+    private boolean trainReady(){return !handTest&&alignment.valid&&data.allMapped&&!data.samples.isEmpty()&&alignment.uncertainty(data.syncUncertaintyNs)<=100_000_000L;}
+    private int writeTraining(File revision,List<Segment> ss)throws Exception {
+        boolean ready=trainReady();long guardMs=(alignment.uncertainty(data.syncUncertaintyNs)+999999)/1000000;List<ImuData.Window> windows=new ArrayList<>();Map<String,Long> durations=new TreeMap<>();
+        try(BufferedWriter segmentsFile=writer(new File(revision,"segments.csv"))){segmentsFile.write("segment_id,start_video_ms,end_video_ms,start_host_ns,end_host_ns,label,confirmed,excluded,reason,quality\n");int n=0;for(Segment s:ss){long start=alignment.host(s.start),end=alignment.host(s.end);String quality=data.quality(start,end);segmentsFile.write(n+++","+s.start+","+s.end+","+start+","+end+","+s.label+","+s.confirmed+","+s.excluded+","+s.reason+","+quality+"\n");if(!ready||!alignment.covered(s.start,s.end)||!s.confirmed||s.excluded||!s.reason.isEmpty()||!CaptureUi.trainable(s.label)||!quality.isEmpty())continue;durations.merge(s.label,(long)(s.end-s.start),Long::sum);
+            boolean event=s.label.equals("jump")||s.label.equals("roll");if(event&&(!s.contextConfirmed||(s.end-s.start)*1_000_000L<4*alignment.uncertainty(data.syncUncertaintyNs)))continue;
+            long a=event?start:alignment.host(s.start+guardMs),b=event?end:alignment.host(s.end-guardMs);if(b<=a)continue;for(ImuData.Window w:ImuData.windows(a,b,s.label,alignment.host(0),alignment.host(durationMs))){if(!alignment.covered(alignment.video(w.start),alignment.video(w.end))||!data.quality(w.start,w.end).isEmpty())continue;boolean safe=true;for(Segment other:ss){if(other==s)continue;long os=alignment.host(other.start),oe=alignment.host(other.end);if(w.start<oe&&w.end>os&&(other.excluded||!other.reason.isEmpty()||!other.confirmed||(!event&&!other.label.equals(s.label))))safe=false;}if(safe)windows.add(w);}}
         }
+        try(BufferedWriter w=writer(new File(revision,"windows.csv"));BufferedWriter samples=writer(new File(revision,"imu_training.csv"))){w.write("window_id,start_host_ns,end_host_ns,start_video_ms,end_video_ms,window_label,semantics,event_start_video_ms,event_end_video_ms,session_name,review_version\n");samples.write("window_id,sequence,epoch,device_time_ms,mapped_host_ns,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,sample_label,window_label,session_name,review_version\n");int id=0;for(ImuData.Window x:windows){w.write(id+","+x.start+","+x.end+","+alignment.video(x.start)+","+alignment.video(x.end)+","+x.label+","+x.kind+","+eventBounds(ss,x)+","+dir.getName()+","+revision.getName()+"\n");for(int si=data.lowerBound(x.start);si<data.samples.size()&&data.samples.get(si).timeNs<x.end;si++){ImuData.Sample s=data.samples.get(si);samples.write(id+","+s.sequence+","+s.epoch+","+s.deviceMs+","+s.timeNs+","+s.ax+","+s.ay+","+s.az+","+s.gx+","+s.gy+","+s.gz+","+sampleLabel(ss,s.timeNs)+","+x.label+","+dir.getName()+","+revision.getName()+"\n");}id++;}}
+        JSONObject summary=new JSONObject();summary.put("state","complete");summary.put("app_version","0.7.1");summary.put("window_count",windows.size());summary.put("eligible_duration_ms",new JSONObject(durations));summary.put("capture_mode",handTest?"hand_test":"cat");summary.put("training_enabled",ready);summary.put("split_policy","split_by_cat_or_session_before_windowing");summary.put("note","event_contains means contains complete event; context is not a per-sample jump label");atomic(new File(revision,"summary.json"),summary.toString(2));return windows.size();
     }
-
-    private final List<LabelEvent> events = new ArrayList<>();
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private File sessionDir;
-    private VideoView videoView;
-    private TextView segmentText;
-    private Button playButton;
-    private int currentIndex;
-    private int durationMs;
-    private long videoStartedElapsedNs;
-    private boolean segmentPlaying;
-    private ImuTimeline timeline;
-    private boolean syncConfirmed;
-    private boolean updatingQuality;
-    private android.widget.CheckBox qualityBox;
-    private org.json.JSONArray undo;
-    private boolean exportRaw;
-    private File latestRevision;
-
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        String sessionName = getIntent().getStringExtra(EXTRA_SESSION_NAME);
-        File sessionsDir = new File(getExternalFilesDir(null), "sessions");
-        sessionDir = sessionName == null ? null : new File(sessionsDir, sessionName);
-        try {
-            if (sessionDir == null || !sessionDir.getCanonicalFile().getParentFile()
-                    .equals(sessionsDir.getCanonicalFile()) || !sessionDir.isDirectory()) {
-                throw new IOException("无效的采集记录");
-            }
-            loadSession();
-            buildUi();
-        } catch (Exception error) {
-            Toast.makeText(this, "无法打开记录：" + error.getMessage(),
-                    Toast.LENGTH_LONG).show();
-            finish();
-        }
-    }
-
-    private void loadSession() throws Exception {
-        File manifestFile = new File(sessionDir, "manifest.json");
-        JSONObject manifest = new JSONObject(readTextFile(manifestFile));
-        videoStartedElapsedNs = manifest.optLong("video_started_elapsed_ns",
-                manifest.getLong("started_elapsed_ns"));
-
-        try (BufferedReader reader = new BufferedReader(
-                new FileReader(new File(sessionDir, "labels.csv")))) {
-            String line = reader.readLine();
-            while ((line = reader.readLine()) != null) {
-                String[] parts = line.split(",", -1);
-                if (parts.length < 4) continue;
-                events.add(new LabelEvent(Long.parseLong(parts[0]),
-                        Long.parseLong(parts[1]), parts[2], parts[3]));
-            }
-        }
-        File draft=new File(sessionDir,"review-v2.json");
-        if(draft.exists()) {JSONObject j=new JSONObject(readTextFile(draft));syncConfirmed=j.optBoolean("sync_confirmed");videoStartedElapsedNs=j.optLong("video_reference_ns",videoStartedElapsedNs);restoreEvents(j.getJSONArray("segments"));}
-        if (events.isEmpty()) {
-            events.add(new LabelEvent(videoStartedElapsedNs,
-                    System.currentTimeMillis(), "unknown", "system"));
-        }
-    }
-
-    private void buildUi() {
-        int padding = dp(14);
-        LinearLayout root = CaptureUi.root(this);
-        root.setOnApplyWindowInsetsListener((view, insets) -> {
-            Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
-            view.setPadding(padding + bars.left, padding + bars.top,
-                    padding + bars.right, padding + bars.bottom);
-            return insets;
-        });
-
-        TextView title = text("视频复核 · 七类行为", 22, CaptureUi.INK);
-        title.setTypeface(null, android.graphics.Typeface.BOLD);
-        root.addView(title);
-
-        segmentText = text("正在加载…", 14, CaptureUi.MUTED);
-        segmentText.setPadding(0, dp(6), 0, dp(6));
-        root.addView(segmentText);
-
-        videoView = new VideoView(this);
-        android.widget.FrameLayout videoFrame=new android.widget.FrameLayout(this);
-        videoFrame.setBackgroundColor(Color.BLACK);
-        root.addView(videoFrame,new LinearLayout.LayoutParams(-1,0,1f));
-        videoFrame.addView(videoView,new android.widget.FrameLayout.LayoutParams(-1,-1,android.view.Gravity.CENTER));
-        MediaController controls = new MediaController(this);
-        controls.setAnchorView(videoView);
-        videoView.setMediaController(controls);
-        videoView.setVideoPath(new File(sessionDir, "video.mp4").getAbsolutePath());
-        videoView.setOnPreparedListener(this::onVideoPrepared);
-
-        timeline=new ImuTimeline(this);root.addView(timeline,new LinearLayout.LayoutParams(-1,dp(66)));
-        LinearLayout navigation = new LinearLayout(this);
-        navigation.setOrientation(LinearLayout.HORIZONTAL);
-        Button previous = button("上一段");
-        previous.setOnClickListener(v -> showSegment(Math.max(0, currentIndex - 1), true));
-        navigation.addView(previous, weighted());
-        playButton = button("播放本段");
-        playButton.setOnClickListener(v -> toggleSegmentPlayback());
-        navigation.addView(playButton, weighted());
-        Button keep = button("确认 / 下一段");
-        keep.setOnClickListener(v -> keepAndNext());
-        navigation.addView(keep, weighted());
-        root.addView(navigation);
-
-        android.widget.ScrollView toolsScroll=new android.widget.ScrollView(this);
-        LinearLayout tools=CaptureUi.column(this);toolsScroll.addView(tools);
-        root.addView(toolsScroll,new LinearLayout.LayoutParams(-1,dp(220)));
-        for(int i=0;i<LABELS.length;i+=4){LinearLayout row=new LinearLayout(this);for(int j=i;j<Math.min(i+4,LABELS.length);j++){final String label=LABELS[j];Button choice=button(CaptureUi.name(label));choice.setTextSize(12);choice.setOnClickListener(v->applyReviewLabel(label));row.addView(choice,weighted());}tools.addView(row);}
-        qualityBox=new android.widget.CheckBox(this);qualityBox.setText("排除本段：出画 / 遮挡 / 缺帧等");qualityBox.setTextColor(CaptureUi.INK);
-        qualityBox.setOnCheckedChangeListener((b,checked)->{if(updatingQuality)return;checkpoint();LabelEvent e=events.get(currentIndex);e.excluded=checked;e.reason=checked?"unusable":"";persistDraft();updateSegmentText();});tools.addView(qualityBox);
-        LinearLayout edits=new LinearLayout(this);Button split=button("此处分段"),boundary=button("调整边界"),undoButton=button("撤销");
-        split.setOnClickListener(v->split());boundary.setOnClickListener(v->editBoundary());undoButton.setOnClickListener(v->{if(undo!=null){try{restoreEvents(undo);undo=null;persistDraft();showSegment(Math.min(currentIndex,events.size()-1),false);}catch(Exception e){toast(e.getMessage());}}});
-        edits.addView(split,weighted());edits.addView(boundary,weighted());edits.addView(undoButton,weighted());tools.addView(edits);
-        Button merge=button("与下一段合并");merge.setOnClickListener(v->{if(currentIndex+1>=events.size())return;checkpoint();events.remove(currentIndex+1);events.get(currentIndex).reviewed=false;persistDraft();showSegment(currentIndex,false);});tools.addView(merge);
-        android.widget.CheckBox sync=new android.widget.CheckBox(this);sync.setText("已核对视频与 IMU 时间对齐（训练导出必需）");sync.setTextColor(CaptureUi.INK);sync.setChecked(syncConfirmed);sync.setOnCheckedChangeListener((b,c)->{syncConfirmed=c;persistDraft();});tools.addView(sync);
-        Button offset=button("调整同步偏移");offset.setOnClickListener(v->{android.widget.EditText field=new android.widget.EditText(this);field.setInputType(android.text.InputType.TYPE_CLASS_NUMBER|android.text.InputType.TYPE_NUMBER_FLAG_SIGNED);field.setHint("毫秒，正数把 IMU 向视频左侧移动");new android.app.AlertDialog.Builder(this).setTitle("校正同步（增量毫秒）").setView(field).setNegativeButton("取消",null).setPositiveButton("应用",(d,w)->{try{long delta=Long.parseLong(field.getText().toString())*1_000_000L;if(Math.abs(delta)>60_000_000_000L){toast("偏移不能超过 60 秒");return;}videoStartedElapsedNs+=delta;for(LabelEvent e:events){e.elapsedNs+=delta;e.reviewed=false;}syncConfirmed=false;sync.setChecked(false);undo=null;timeline.reference(videoStartedElapsedNs);persistDraft();showSegment(currentIndex,false);}catch(Exception e){toast("请输入整数毫秒");}}).show();});tools.addView(offset);
-        TextView note=text("静止不等于睡眠。时间基于接收时刻，短动作请先核对同步。",12,CaptureUi.MUTED);tools.addView(note);
-        Button save = button("保存复核结果");
-        save.setOnClickListener(v -> saveReview());
-        root.addView(save);
-        LinearLayout exports=new LinearLayout(this);Button training=button("导出训练资料"),raw=button("导出原始资料");training.setOnClickListener(v->export(false));raw.setOnClickListener(v->export(true));exports.addView(training,weighted());exports.addView(raw,weighted());root.addView(exports);
-        setContentView(root);
-    }
-
-    private void onVideoPrepared(MediaPlayer player) {
-        durationMs = player.getDuration();
-        try{timeline.load(new File(sessionDir,"imu.csv"),videoStartedElapsedNs,durationMs,ms->{stopSegmentPlayback();videoView.seekTo(ms);timeline.position(ms);});}catch(Exception e){toast("波形读取失败："+e.getMessage());}
-        // Drop candidate transitions outside the playable video interval, preserving the last pre-roll state.
-        while(events.size()>1 && events.get(1).elapsedNs<=videoStartedElapsedNs)events.remove(0);
-        events.get(0).elapsedNs=videoStartedElapsedNs;
-        events.removeIf(e->e.elapsedNs>=videoStartedElapsedNs+durationMs*1_000_000L);
-        if(events.isEmpty())events.add(new LabelEvent(videoStartedElapsedNs,System.currentTimeMillis(),"unknown","system"));
-        videoView.seekTo(1);
-        showSegment(0, false);
-    }
-
-    private void showSegment(int index, boolean play) {
-        if (events.isEmpty()) return;
-        currentIndex = Math.max(0, Math.min(index, events.size() - 1));
-        stopSegmentPlayback();
-        videoView.seekTo(segmentStartMs(currentIndex));
-        timeline.position(segmentStartMs(currentIndex));
-        updateSegmentText();
-        if (play) startSegmentPlayback();
-    }
-
-    private void updateSegmentText() {
-        LabelEvent event = events.get(currentIndex);
-        if(qualityBox!=null){updatingQuality=true;qualityBox.setChecked(event.excluded);updatingQuality=false;}
-        long start = segmentStartMs(currentIndex);
-        long end = segmentEndMs(currentIndex);
-        int reviewedCount = 0;
-        for (LabelEvent item : events) if (item.reviewed) reviewedCount++;
-        segmentText.setText(String.format(Locale.US,
-                "片段 %d/%d · %.1f–%.1f 秒\n行为：%s（%s） · 已确认 %d/%d",
-                currentIndex + 1, events.size(), start / 1000f, end / 1000f,
-                CaptureUi.name(event.label), event.reviewed?"人工确认":"候选", reviewedCount, events.size()));
-        segmentText.append("\n"+evidenceAt(event.elapsedNs));
-    }
-
-    private int segmentStartMs(int index) {
-        long value = (events.get(index).elapsedNs - videoStartedElapsedNs) / 1_000_000L;
-        return (int) Math.max(0, Math.min(durationMs, value));
-    }
-
-    private int segmentEndMs(int index) {
-        if (index + 1 < events.size()) return segmentStartMs(index + 1);
-        return Math.max(segmentStartMs(index), durationMs);
-    }
-
-    private void toggleSegmentPlayback() {
-        if (segmentPlaying) stopSegmentPlayback();
-        else startSegmentPlayback();
-    }
-
-    private void startSegmentPlayback() {
-        if (durationMs <= 0) return;
-        int start = segmentStartMs(currentIndex);
-        int end = segmentEndMs(currentIndex);
-        if (videoView.getCurrentPosition() < start || videoView.getCurrentPosition() >= end) {
-            videoView.seekTo(start);
-        }
-        segmentPlaying = true;
-        playButton.setText("暂停");
-        videoView.start();
-        handler.post(segmentWatcher);
-    }
-
-    private final Runnable segmentWatcher = new Runnable() {
-        @Override
-        public void run() {
-            if (!segmentPlaying) return;
-            timeline.position(videoView.getCurrentPosition());
-            if (videoView.getCurrentPosition() >= segmentEndMs(currentIndex) - 50) {
-                videoView.seekTo(segmentStartMs(currentIndex));
-                videoView.start();
-                handler.postDelayed(this,100);
-            } else {
-                handler.postDelayed(this, 100);
-            }
-        }
-    };
-
-    private void stopSegmentPlayback() {
-        segmentPlaying = false;
-        handler.removeCallbacks(segmentWatcher);
-        if (videoView != null && videoView.isPlaying()) videoView.pause();
-        if (playButton != null) playButton.setText("播放本段");
-    }
-
-    private void keepAndNext() {
-        LabelEvent e=events.get(currentIndex);
-        if(!CaptureUi.trainable(e.label)&&!e.label.equals("unknown")){toast("请从七类行为或无法判断中选择，旧粗标签不能直接确认");return;}
-        checkpoint();
-        events.get(currentIndex).reviewed = true;
-        events.get(currentIndex).source="human_review";
-        persistDraft();
-        advanceAfterReview();
-    }
-
-    private void applyReviewLabel(String label) {
-        checkpoint();
-        LabelEvent event = events.get(currentIndex);
-        event.label = label;
-        event.source = "human_review";
-        event.reviewed = true;
-        persistDraft();
-        advanceAfterReview();
-    }
-
-    private void advanceAfterReview() {
-        if (currentIndex + 1 < events.size()) showSegment(currentIndex + 1, true);
-        else {
-            stopSegmentPlayback();
-            updateSegmentText();
-            Toast.makeText(this, "已到最后一段，可以保存复核结果",
-                    Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    private String evidenceAt(long ns){
-        String result="设备预测：此会话无记录";
-        File file=new File(sessionDir,"evidence.csv");if(!file.exists())return result;
-        try(BufferedReader r=new BufferedReader(new FileReader(file))){String line;long last=0;while((line=r.readLine())!=null){String[] a=line.split(",",4);if(a.length<4||!a[2].equals("prediction"))continue;long t=Long.parseLong(a[0]);if(t>ns+2_000_000_000L)break;if(t>=last){last=t;String payload=a[3].replace("\"","");String[] fields=payload.split(",");if(fields.length>=5)result="设备："+CaptureUi.name(fields[4])+" · 窗口 "+fields[3]+"（近似对齐）";}}if(last>0&&ns-last>5_000_000_000L)return "设备预测已过期";}catch(Exception e){return "设备证据无法读取";}return result;
-    }
-    private void flagImuGaps() throws Exception {
-        boolean[] seen=new boolean[events.size()],bad=new boolean[events.size()];long previous=-1,sequence=-1;int previousIndex=-1,index=0;
-        try(BufferedReader r=new BufferedReader(new FileReader(new File(sessionDir,"imu.csv")))){r.readLine();String line;while((line=r.readLine())!=null){String[] a=line.split(",");if(a.length<12)continue;long ns=Long.parseLong(a[1]),seq=Long.parseLong(a[3]);while(index+1<events.size()&&events.get(index+1).elapsedNs<=ns)index++;if(ns<videoStartedElapsedNs||ns>=videoStartedElapsedNs+durationMs*1_000_000L)continue;seen[index]=true;if(previous>=0&&(ns-previous>250_000_000L||((seq-sequence)&0xffffffffL)!=1)){for(int j=Math.max(0,previousIndex);j<=index;j++)bad[j]=true;}previous=ns;sequence=seq;previousIndex=index;}}
-        for(int i=0;i<events.size();i++)if(!seen[i]||bad[i]){events.get(i).excluded=true;events.get(i).reason=!seen[i]?"no_imu":"imu_gap";}
-    }
-
-    private void toast(String msg){Toast.makeText(this,msg,Toast.LENGTH_LONG).show();}
-    private org.json.JSONArray snapshot() throws Exception {
-        org.json.JSONArray a=new org.json.JSONArray();for(LabelEvent e:events){JSONObject j=new JSONObject();j.put("elapsed_ns",e.elapsedNs);j.put("wall_ms",e.wallMs);j.put("label",e.label);j.put("source",e.source);j.put("reviewed",e.reviewed);j.put("excluded",e.excluded);j.put("reason",e.reason);a.put(j);}return a;
-    }
-    private void restoreEvents(org.json.JSONArray a) throws Exception {events.clear();for(int i=0;i<a.length();i++){JSONObject j=a.getJSONObject(i);LabelEvent e=new LabelEvent(j.getLong("elapsed_ns"),j.getLong("wall_ms"),j.getString("label"),j.getString("source"));e.reviewed=j.optBoolean("reviewed");e.excluded=j.optBoolean("excluded");e.reason=j.optString("reason");events.add(e);}}
-    private void checkpoint(){try{undo=snapshot();}catch(Exception e){toast("无法创建撤销点");}}
-    private JSONObject reviewJson() throws Exception {JSONObject j=new JSONObject();j.put("schema_version",2);j.put("taxonomy_version","pawlink-actions-v1");j.put("reviewed_wall_ms",System.currentTimeMillis());j.put("sync_confirmed",syncConfirmed);j.put("sync_method","manual_check_receive_time");j.put("video_reference_ns",videoStartedElapsedNs);j.put("complete",events.stream().allMatch(e->e.reviewed||e.excluded));j.put("segments",snapshot());return j;}
-    private boolean persistDraft(){try{File tmp=new File(sessionDir,"review-v2.json.tmp");try(BufferedWriter w=new BufferedWriter(new FileWriter(tmp))){w.write(reviewJson().toString(2));}if(!tmp.renameTo(new File(sessionDir,"review-v2.json")))throw new IOException("无法保存复核进度");return true;}catch(Exception e){toast("保存失败："+e.getMessage());return false;}}
-    private void split(){int pos=videoView.getCurrentPosition();if(pos<=segmentStartMs(currentIndex)+50||pos>=segmentEndMs(currentIndex)-50){toast("请先暂停在片段内部，再分段");return;}checkpoint();LabelEvent old=events.get(currentIndex);old.reviewed=false;LabelEvent e=new LabelEvent(videoStartedElapsedNs+pos*1_000_000L,old.wallMs,old.label,old.source);e.excluded=old.excluded;e.reason=old.reason;events.add(currentIndex+1,e);persistDraft();showSegment(currentIndex+1,false);}
-    private void editBoundary(){
-        LinearLayout form=CaptureUi.column(this);android.widget.EditText input=new android.widget.EditText(this);input.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);input.setText(String.valueOf(segmentStartMs(currentIndex)));form.addView(text("本段起点（视频毫秒），首段固定为 0",14,CaptureUi.INK));form.addView(input);
-        new android.app.AlertDialog.Builder(this).setTitle("调整片段起点").setView(form).setNegativeButton("取消",null).setPositiveButton("保存",(d,w)->{try{int ms=Integer.parseInt(input.getText().toString());if(currentIndex==0||ms<=segmentStartMs(currentIndex-1)||ms>=segmentEndMs(currentIndex)){toast("边界必须位于相邻片段内，首段起点不可改");return;}checkpoint();events.get(currentIndex).elapsedNs=videoStartedElapsedNs+ms*1_000_000L;events.get(currentIndex).reviewed=false;events.get(currentIndex-1).reviewed=false;persistDraft();showSegment(currentIndex,false);}catch(Exception e){toast("请输入有效毫秒数");}}).show();
-    }
-    private boolean saveFiles() {
-        if(durationMs<=0){toast("视频尚未就绪");return false;}
-        try {
-            flagImuGaps();
-            if(!persistDraft())return false;
-            File revisions=new File(sessionDir,"reviews");latestRevision=new File(revisions,"revision-"+System.currentTimeMillis());if(!latestRevision.mkdirs())throw new IOException("无法创建复核版本");
-            try(BufferedWriter w=new BufferedWriter(new FileWriter(new File(latestRevision,"review.json")))){w.write(reviewJson().toString(2));}
-            try(BufferedWriter w=new BufferedWriter(new FileWriter(new File(latestRevision,"segments.csv")))){w.write("start_elapsed_ns,end_elapsed_ns,label,reviewed,excluded,reason\n");for(int i=0;i<events.size();i++){LabelEvent e=events.get(i);long end=i+1<events.size()?events.get(i+1).elapsedNs:videoStartedElapsedNs+durationMs*1_000_000L;w.write(e.elapsedNs+","+end+","+e.label+","+e.reviewed+","+e.excluded+","+e.reason+"\n");}}
-            try(BufferedReader r=new BufferedReader(new FileReader(new File(sessionDir,"imu.csv")));BufferedWriter w=new BufferedWriter(new FileWriter(new File(latestRevision,"imu_training.csv")))){String line=r.readLine();if(line!=null)w.write(line+",session_name,review_version\n");int index=0;while((line=r.readLine())!=null){String[] a=line.split(",",-1);if(a.length<12)continue;long ns=Long.parseLong(a[1]);while(index+1<events.size()&&events.get(index+1).elapsedNs<=ns)index++;LabelEvent e=events.get(index);if(!syncConfirmed||!e.reviewed||e.excluded||!CaptureUi.trainable(e.label)||ns<videoStartedElapsedNs||ns>=videoStartedElapsedNs+durationMs*1_000_000L)continue;a[4]=e.label;a[5]="human_review";w.write(String.join(",",a)+","+sessionDir.getName()+","+latestRevision.getName()+"\n");}}
-            return true;
-        }catch(Exception e){toast("保存失败："+e.getMessage());return false;}
-    }
-    private void saveReview(){if(saveFiles())toast("复核版本已保存，原始文件未修改"+(!syncConfirmed?"；尚未核对同步，训练文件为空":""));}
-    private void export(boolean raw){
-        if(!raw&&!syncConfirmed){toast("请先核对视频与 IMU 同步，再启用训练导出");return;}
-        if(!raw&&events.stream().noneMatch(e->e.reviewed&&!e.excluded&&CaptureUi.trainable(e.label))){toast("没有已确认的可训练片段");return;}
-        if(!raw&&!saveFiles())return;exportRaw=raw;
-        android.content.Intent intent=new android.content.Intent(android.content.Intent.ACTION_CREATE_DOCUMENT);intent.setType("application/zip");intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);intent.putExtra(android.content.Intent.EXTRA_TITLE,sessionDir.getName()+(raw?"-raw":"-training")+".zip");startActivityForResult(intent,41);
-    }
-    @Override protected void onActivityResult(int request,int result,android.content.Intent data){super.onActivityResult(request,result,data);if(request!=41||result!=RESULT_OK||data==null||data.getData()==null)return;
-        final android.net.Uri uri=data.getData();final boolean raw=exportRaw;final File revision=latestRevision;
-        new Thread(()->{try(java.util.zip.ZipOutputStream zip=new java.util.zip.ZipOutputStream(getContentResolver().openOutputStream(uri))){if(raw){for(File f:sessionDir.listFiles())if(f.isFile()&&!f.getName().startsWith("review")&&!f.getName().contains("reviewed"))zipFile(zip,f,f.getName());}else{for(File f:revision.listFiles())zipFile(zip,f,f.getName());zipFile(zip,new File(sessionDir,"manifest.json"),"source-manifest.json");}runOnUiThread(()->toast("导出完成"));}catch(Exception e){runOnUiThread(()->toast("导出失败："+e.getMessage()));}},"pawlink-export").start();
-    }
-    private void zipFile(java.util.zip.ZipOutputStream zip,File file,String name)throws IOException{zip.putNextEntry(new java.util.zip.ZipEntry(name));try(java.io.FileInputStream in=new java.io.FileInputStream(file)){byte[] b=new byte[32768];int n;while((n=in.read(b))!=-1)zip.write(b,0,n);}zip.closeEntry();}
-
-    private String readTextFile(File file) throws IOException {
-        StringBuilder value = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                value.append(line).append('\n');
-            }
-        }
-        return value.toString();
-    }
-
-    private TextView text(String value, int sp, int color) {
-        TextView view = new TextView(this);
-        view.setText(value);
-        view.setTextSize(sp);
-        view.setTextColor(color);
-        return view;
-    }
-
-    private Button button(String value) {
-        Button button = CaptureUi.button(this,value,false);
-        button.setText(value);
-        button.setAllCaps(false);
-        return button;
-    }
-
-    private LinearLayout.LayoutParams weighted() {
-        return new LinearLayout.LayoutParams(0,
-                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-    }
-
-    private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
-    }
-
-    @Override protected void onPause(){super.onPause();stopSegmentPlayback();}
-
-    @Override
-    protected void onDestroy() {
-        stopSegmentPlayback();
-        if (videoView != null) videoView.stopPlayback();
-        super.onDestroy();
-    }
+    private String sampleLabel(List<Segment> ss,long ns){int ms=alignment.video(ns);for(Segment s:ss)if(s.confirmed&&!s.excluded&&ms>=s.start&&ms<s.end)return s.label;return "context_unlabeled";}
+    private String eventBounds(List<Segment> ss,ImuData.Window w){if(!w.kind.equals("event_contains"))return ",";for(Segment s:ss)if(s.confirmed&&s.label.equals(w.label)&&alignment.host(s.start)>=w.start&&alignment.host(s.end)<=w.end)return s.start+","+s.end;return ",";}
+    private void export(boolean rawData){if(!loaded||busy)return;if(rawData){launchExport(true);return;}if(!trainReady()){toast(handTest?"手持测试不进入猫训练集，请导出原始资料":"先完成设备时钟映射与视频校准，合计估计误差须 ≤100 ms");return;}saveVersion(true);}
+    private void launchExport(boolean rawData){exportRaw=rawData;android.content.Intent i=new android.content.Intent(android.content.Intent.ACTION_CREATE_DOCUMENT);i.setType("application/zip");i.addCategory(android.content.Intent.CATEGORY_OPENABLE);i.putExtra(android.content.Intent.EXTRA_TITLE,dir.getName()+(rawData?"-raw":"-training")+".zip");startActivityForResult(i,41);}
+    @Override protected void onActivityResult(int request,int result,android.content.Intent intent){super.onActivityResult(request,result,intent);if(request!=41||result!=RESULT_OK||intent==null||intent.getData()==null)return;android.net.Uri uri=intent.getData();boolean rawData=exportRaw;File revision=latestRevision;setBusy(true);io.execute(()->{try(java.util.zip.ZipOutputStream zip=new java.util.zip.ZipOutputStream(getContentResolver().openOutputStream(uri))){if(rawData)zipTree(zip,dir,"");else{zipTree(zip,revision,"");zipFile(zip,new File(dir,"manifest.json"),"source-manifest.json");zipFile(zip,new File(dir,"sync.csv"),"source-sync.csv");}runOnUiThread(()->{setBusy(false);toast("导出完成");});}catch(Exception e){runOnUiThread(()->{setBusy(false);toast("导出失败："+e.getMessage());});}});}
+    private void zipTree(java.util.zip.ZipOutputStream zip,File root,String prefix)throws IOException{File[] files=root.listFiles();if(files==null)throw new IOException("无法读取导出目录");for(File f:files){if(java.nio.file.Files.isSymbolicLink(f.toPath())||f.getName().endsWith(".tmp"))continue;if(f.isDirectory())zipTree(zip,f,prefix+f.getName()+"/");else zipFile(zip,f,prefix+f.getName());}}
+    private void zipFile(java.util.zip.ZipOutputStream zip,File file,String name)throws IOException{if(!file.exists())return;zip.putNextEntry(new java.util.zip.ZipEntry(name));try(InputStream in=new FileInputStream(file)){byte[] b=new byte[32768];int n;while((n=in.read(b))!=-1)zip.write(b,0,n);}zip.closeEntry();}
+    private static void atomic(File file,String text)throws IOException{File tmp=new File(file.getParentFile(),file.getName()+".tmp");try(FileOutputStream out=new FileOutputStream(tmp)){out.write(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));out.getFD().sync();}java.nio.file.Files.move(tmp.toPath(),file.toPath(),java.nio.file.StandardCopyOption.REPLACE_EXISTING,java.nio.file.StandardCopyOption.ATOMIC_MOVE);}
+    private static BufferedWriter writer(File f)throws IOException{return new BufferedWriter(new FileWriter(f));}
+    private static String read(File f)throws IOException{return new String(java.nio.file.Files.readAllBytes(f.toPath()),java.nio.charset.StandardCharsets.UTF_8);}
+    private String format(int ms){return String.format(Locale.US,"%.3f",ms/1000.0);}
+    private LinearLayout row(){LinearLayout r=new LinearLayout(this);r.setOrientation(LinearLayout.HORIZONTAL);return r;}
+    private LinearLayout.LayoutParams weight(){return new LinearLayout.LayoutParams(0,-2,1);}
+    private Button button(String t,android.view.View.OnClickListener l){Button b=CaptureUi.button(this,t,false);b.setTextSize(11);b.setOnClickListener(l);return b;}
+    private int dp(int n){return CaptureUi.dp(this,n);}
+    private void toast(String s){Toast.makeText(this,s,Toast.LENGTH_LONG).show();}
+    @Override protected void onPause(){super.onPause();stop();}
+    @Override protected void onDestroy(){destroyed=true;stop();decodeGeneration++;io.execute(()->{if(frames!=null)try{frames.release();}catch(Exception ignored){}});io.shutdown();super.onDestroy();}
 }
